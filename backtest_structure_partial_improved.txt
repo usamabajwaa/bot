@@ -1,0 +1,77 @@
+================================================================================
+BACKTEST: STRUCTURE-BASED PARTIAL PROFIT IMPROVEMENT
+================================================================================
+
+CHANGES:
+--------
+- Increased structure buffer from 1x to 2x (6 ticks instead of 3)
+- More aggressive partial exits before hitting structure levels
+- Applied to both backtesting and live trading
+
+RATIONALE:
+----------
+- Taking partials earlier before support/resistance levels
+- Locks in profit before price potentially reverses at structure levels
+- Reduces risk of giving back profits when price hits zones
+
+RESULTS (2x Buffer - More Aggressive):
+---------------------------------------
+Total Trades:        978
+Win Rate:            79.0%
+Total P&L:           $78,020.17
+Avg P&L/Trade:       $79.78
+Profit Factor:       1.81
+Max Drawdown:        $4,160.15
+
+Session Breakdown:
+  asia:   203 trades, $17,334.12 P&L, 79.8% win rate
+  london: 436 trades, $30,945.73 P&L, 82.3% win rate (BEST)
+  us:     339 trades, $29,740.32 P&L, 74.3% win rate
+
+
+COMPARISON: 2x Buffer vs 1x Buffer (Previous)
+-----------------------------------------------
+Previous (1x buffer = 3 ticks):
+  Total Trades:        906
+  Win Rate:            74.8%
+  Total P&L:           $59,132.28
+  Profit Factor:       1.57
+  Max Drawdown:        $4,919.08
+
+Improved (2x buffer = 6 ticks):
+  Total Trades:        978 (+72 trades, +8%)
+  Win Rate:            79.0% (+4.2%)
+  Total P&L:           $78,020.17 (+$18,887.89, +32.0%)
+  Profit Factor:       1.81 (+0.24)
+  Max Drawdown:        $4,160.15 (-$758.93, -15.4%)
+
+KEY FINDINGS:
+------------
+✅ SIGNIFICANT IMPROVEMENT with 2x buffer:
+   - +$18,888 in total P&L (+32%)
+   - Higher win rate (79.0% vs 74.8%)
+   - Better profit factor (1.81 vs 1.57)
+   - Lower drawdown (-15.4%)
+
+✅ More trades captured (978 vs 906):
+   - Taking partials earlier allows more trades
+   - Structure-based exits working better
+
+✅ All sessions improved:
+   - London: 82.3% win rate (best)
+   - Asia: 79.8% win rate
+   - US: 74.3% win rate
+
+CONCLUSION:
+-----------
+✅ 2x buffer (6 ticks) is MUCH BETTER than 1x buffer (3 ticks)
+✅ Taking partials earlier before structure levels significantly improves performance
+✅ This change should be applied to live trading
+
+The more aggressive structure-based partial profit strategy:
+- Locks in profit before price hits support/resistance
+- Reduces risk of reversals at structure levels
+- Improves overall win rate and profit factor
+
+================================================================================
+

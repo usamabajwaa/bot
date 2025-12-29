@@ -1,0 +1,99 @@
+================================================================================
+BACKTEST: ALL 3 SESSIONS - 10 CONTRACTS, NO MAX TRADES LIMIT
+================================================================================
+
+CONFIGURATION:
+--------------
+- Data Source: TopStep API (MGC Micro Gold)
+- Position Size: 10 contracts (reduced from 20)
+- Max Trades/Day: 9999 (unlimited)
+- Daily Loss Limit: -$1500
+- Sessions: 
+  * Asia: 18:00-02:00 UTC
+  * London: 08:00-16:00 UTC (corrected)
+  * US: 14:30-21:00 UTC (optimized hours)
+- Confirmation: Rejection OR Engulfing
+- Early BE: 40 ticks enabled
+
+RESULTS:
+--------
+Total Trades:        906
+Win Rate:            74.8%
+Total P&L:           $59,132.28
+Avg P&L/Trade:       $65.27
+Profit Factor:       1.57
+Max Drawdown:        $4,919.08
+
+Session Breakdown:
+  asia:   187 trades, $11,625.53 P&L, 74.3% win rate
+  london: 392 trades, $24,736.04 P&L, 78.1% win rate (BEST WIN RATE)
+  us:     327 trades, $22,770.71 P&L, 71.2% win rate
+
+
+COMPARISON: 10 Contracts vs 20 Contracts (All 3 Sessions)
+----------------------------------------------------------
+Previous (20 contracts, max 10 trades/day):
+  Total Trades:        247
+  Total P&L:           $42,262.89
+  Win Rate:            76.9%
+  Profit Factor:       1.93
+  Max Drawdown:        $3,634.04
+
+Current (10 contracts, unlimited trades):
+  Total Trades:        906 (+659 trades, +267%)
+  Total P&L:           $59,132.28 (+$16,869.39, +39.9%)
+  Win Rate:            74.8% (-2.1%)
+  Profit Factor:       1.57 (-0.36)
+  Max Drawdown:        $4,919.08 (+$1,285.04, +35.4%)
+
+KEY FINDINGS:
+------------
+✅ Removing max trades limit significantly increases trade count:
+   - 906 trades vs 247 (3.7x more trades)
+   - More opportunities captured
+
+✅ All 3 sessions are now contributing:
+   - Asia: 187 trades, +$11,625 (74.3% win rate)
+   - London: 392 trades, +$24,736 (78.1% win rate) - BEST PERFORMER
+   - US: 327 trades, +$22,770 (71.2% win rate)
+
+✅ Total P&L increased by $16,869 (+39.9%):
+   - Despite smaller position size (10 vs 20 contracts)
+   - More trades compensate for smaller size
+
+⚠️ Profit factor decreased (1.57 vs 1.93):
+   - More trades = more opportunities but also more risk
+   - Still profitable overall
+
+✅ London session is the best performer:
+   - 392 trades (most)
+   - $24,736 P&L (highest)
+   - 78.1% win rate (highest)
+
+COMPARISON WITH ASIA + US (20 contracts):
+------------------------------------------
+Asia + US (20 contracts, max 10 trades/day):
+  Total Trades:        252
+  Total P&L:           $58,117.12
+  Win Rate:            74.2%
+  Profit Factor:       2.02
+
+All 3 Sessions (10 contracts, unlimited):
+  Total Trades:        906 (+654 trades)
+  Total P&L:           $59,132.28 (+$1,015.16, +1.7%)
+  Win Rate:            74.8% (+0.6%)
+  Profit Factor:       1.57 (-0.45)
+
+RECOMMENDATION:
+---------------
+✅ ALL 3 SESSIONS with 10 contracts and unlimited trades:
+   - Highest total P&L: $59,132
+   - Most trades: 906
+   - All sessions profitable
+   - London session is the star performer (78.1% win rate, $24,736 P&L)
+
+The combination of all 3 sessions with unlimited trades and 10 contracts
+provides the best overall performance, with London being the top contributor.
+
+================================================================================
+
