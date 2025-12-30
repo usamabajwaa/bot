@@ -56,3 +56,13 @@ logs/
 # OS files
 .DS_Store
 Thumbs.db
+# Live trading data (changes frequently)
+trades_decisions.csv
+
+# Test output directories  
+replay_aggregated_results/
+replay_with_improvements/
+test_replay_output/
+
+# Persisted zones (keep in git but allow updates)
+# zones.json - keep this, it's important
