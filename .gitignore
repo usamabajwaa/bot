@@ -23,3 +23,36 @@ trades.csv
 env/
 venv/
 
+# Test output directories
+baseline_*/
+features_results/
+moderate_results/
+zone_improvements_test/
+test_replay_output/
+
+# Temporary configs
+config_baseline_*.json
+config_zone_improvements_only.json
+config_with_features.json
+config_moderate.json
+
+# Credentials (keep backup)
+credentials.json
+!credentials.json.backup
+
+# Large data files
+*.zip
+broker.zip
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db

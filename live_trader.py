@@ -155,6 +155,13 @@ class LiveTrader:
         self.replay_data_dir.mkdir(exist_ok=True)
         self.max_replay_files = 200  # Keep only last 200 replay files
         
+        # Rolling DataFrame for zone updates (avoid rebuilding zones every loop)
+        self.rolling_df: Optional[pd.DataFrame] = None
+        self.rolling_df_max_bars = 2000  # Keep last 2000 bars in memory
+        self.last_zone_update_bars: Optional[int] = None  # Track number of bars in rolling_df when zones were last updated
+        self.zone_update_interval_bars = 20  # Update zones every 20 new bars (or 15 minutes)
+        self.last_zone_update_time: Optional[datetime] = None
+        
         # Replay mode: save bars when signals are generated
         self.save_replay_data = True  # Configurable flag
         self.replay_data_dir = Path('replay_data')
@@ -373,7 +380,8 @@ class LiveTrader:
                     end_time=current_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     count=10000,  # Large count to get all bars in chunk
                     live=False,
-                    unit=2
+                    unit=2,
+                    include_partial=False  # Explicitly exclude partial bars
                 )
                 
                 if bars:
@@ -628,7 +636,8 @@ class LiveTrader:
                 
                 df = df.drop(columns=['time_diff'])
             
-            # Exclude last bar if potentially incomplete (less than 1.5 bar intervals old)
+            # Exclude last bar if it hasn't completed yet (bar period hasn't ended)
+            # A bar starting at T should only be used after T + interval
             if len(df) > 0:
                 last_bar_time = pd.to_datetime(df['timestamp'].iloc[-1])
                 if last_bar_time.tzinfo is None:
@@ -636,11 +645,13 @@ class LiveTrader:
                 else:
                     last_bar_time = last_bar_time.astimezone(pytz.UTC)
                 
-                time_since_last_bar = (now - last_bar_time).total_seconds()
-                min_bar_age = bar_interval_seconds * 1.5  # 270 seconds for 3-min bars
+                # Calculate when the bar should end (start_time + interval)
+                bar_end_time = last_bar_time + pd.Timedelta(seconds=bar_interval_seconds)
                 
-                if time_since_last_bar < min_bar_age:
-                    logger.info(f"Excluding potentially incomplete bar: {time_since_last_bar:.0f}s old (< {min_bar_age:.0f}s threshold)")
+                # Only use bar if its period has ended
+                if now < bar_end_time:
+                    time_until_completion = (bar_end_time - now).total_seconds()
+                    logger.info(f"Excluding incomplete bar: bar at {last_bar_time.strftime('%Y-%m-%d %H:%M:%S UTC')} ends at {bar_end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}, {time_until_completion:.0f}s until completion")
                     df = df.iloc[:-1].copy()
             
             # Validate data freshness
@@ -690,8 +701,18 @@ class LiveTrader:
         else:
             timestamp_utc = timestamp.astimezone(pytz.UTC)
         
-        # Check if bar is stale (use bar timestamp, not current time, for session detection)
+        # CRITICAL: Verify bar is actually complete before generating signal
+        # Bar interval is 3 minutes (180 seconds)
+        bar_interval_seconds = 3 * 60  # 180 seconds
+        bar_end_time = timestamp_utc + pd.Timedelta(seconds=bar_interval_seconds)
         now_utc = pd.Timestamp.now(tz=pytz.UTC)
+        
+        if now_utc < bar_end_time:
+            time_until_completion = (bar_end_time - now_utc).total_seconds()
+            logger.warning(f"Bar at {timestamp_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} is not yet complete (ends at {bar_end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}). Skipping signal check. {time_until_completion:.0f}s until completion.")
+            return None
+        
+        # Check if bar is stale (use bar timestamp, not current time, for session detection)
         bar_age_seconds = (now_utc - timestamp_utc).total_seconds()
         stale_threshold_seconds = 180 * 3  # 9 minutes (3 bar intervals)
         
@@ -922,8 +943,19 @@ class LiveTrader:
         }
         
         try:
-            sl_ticks = int(abs(signal['risk_ticks']))
-            tp_ticks = int(abs(signal['reward_ticks']))
+            import math
+            # Use ceil() for SL (safer - ensures we don't shrink the stop distance)
+            # Use round() for TP (balanced - maintains R:R closer to planned)
+            sl_ticks = math.ceil(abs(signal['risk_ticks']))
+            tp_ticks = round(abs(signal['reward_ticks']))
+            
+            # TODO: Change 12 - Fill-based bracket anchoring
+            # Currently places bracket order with ticks from expected entry_price
+            # Future enhancement: Place market order first, wait for fill, then place SL/TP from actual fill price
+            # This requires API support for separate order placement and fill confirmation
+            fill_based = self.config.get('execution_mode', {}).get('fill_based_brackets', False)
+            if fill_based:
+                logger.warning("Fill-based bracket anchoring not yet implemented - using tick-based brackets")
             
             result = self.client.place_bracket_order(
                 contract_id=self.contract.id,
@@ -956,6 +988,41 @@ class LiveTrader:
             
             logger.info(f"OK Order placed successfully. Order ID: {order_id}")
             
+            # CRITICAL FIX: Verify bracket orders (SL/TP) were actually created
+            import time
+            time.sleep(1.0)  # Wait for orders to be processed by broker
+            
+            stop_found = False
+            tp_found = False
+            try:
+                open_orders = self.client.get_open_orders()
+                for order in open_orders:
+                    if order.get('contractId') == self.contract.id:
+                        order_type = order.get('type')
+                        if order_type == 4:  # STOP order
+                            self.current_position['stop_order_id'] = order.get('id')
+                            self.current_position['stop_loss'] = order.get('stopPrice', signal['stop_loss'])
+                            stop_found = True
+                            logger.info(f"VERIFIED: Stop loss order found - ID {order.get('id')} @ ${order.get('stopPrice', 0):.2f}")
+                        elif order_type == 1:  # LIMIT order (could be TP)
+                            limit_price = order.get('limitPrice', 0)
+                            # Check if this is a take profit (on correct side of entry)
+                            if signal['type'] == 'long' and limit_price > signal['entry_price']:
+                                self.current_position['tp_order_id'] = order.get('id')
+                                tp_found = True
+                                logger.info(f"VERIFIED: Take profit order found - ID {order.get('id')} @ ${limit_price:.2f}")
+                            elif signal['type'] == 'short' and limit_price < signal['entry_price']:
+                                self.current_position['tp_order_id'] = order.get('id')
+                                tp_found = True
+                                logger.info(f"VERIFIED: Take profit order found - ID {order.get('id')} @ ${limit_price:.2f}")
+            except Exception as e:
+                logger.warning(f"Could not verify bracket orders: {e}")
+            
+            # CRITICAL: If stop loss not found, place standalone stop loss
+            if not stop_found:
+                logger.error("CRITICAL: Stop loss order NOT FOUND after bracket order! Placing fallback SL...")
+                self._place_fallback_stop_loss(signal)
+            
             # Send alert (non-blocking - wrap in try/except to prevent hanging)
             try:
                 self.alerts.trade_entry(
@@ -979,6 +1046,48 @@ class LiveTrader:
             self.current_position = None
             self._executing_entry = False  # Release execution lock
             self._trading_locked = False  # Release trading lock
+            return False
+    
+    def _place_fallback_stop_loss(self, signal: Dict) -> bool:
+        """
+        Place a standalone stop loss order when bracket order didn't create one.
+        This is a CRITICAL safety measure to protect the position.
+        """
+        if not self.current_position:
+            logger.error("Cannot place fallback SL: No position exists")
+            return False
+        
+        try:
+            side = OrderSide.ASK if signal['type'] == 'long' else OrderSide.BID
+            stop_price = signal['stop_loss']
+            quantity = self.position_size
+            
+            logger.info(f"Placing fallback stop loss: {side.name} {quantity} @ ${stop_price:.2f}")
+            
+            result = self.client.place_order(
+                contract_id=self.contract.id,
+                order_type=OrderType.STOP,
+                side=side,
+                size=quantity,
+                stop_price=stop_price
+            )
+            
+            if result and result.get('success'):
+                stop_order_id = result.get('orderId')
+                self.current_position['stop_order_id'] = stop_order_id
+                self.current_position['stop_loss'] = stop_price
+                logger.info(f"Fallback stop loss placed successfully: ID {stop_order_id} @ ${stop_price:.2f}")
+                self.alerts.info(f"Fallback SL placed: ${stop_price:.2f}")
+                return True
+            else:
+                error = result.get('errorMessage', 'Unknown error') if result else 'No response'
+                logger.error(f"CRITICAL: Fallback stop loss FAILED: {error}")
+                self.alerts.error(f"CRITICAL: Position has NO stop loss! SL placement failed: {error}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"CRITICAL: Exception placing fallback stop loss: {e}")
+            self.alerts.error(f"CRITICAL: Position has NO stop loss! Exception: {e}")
             return False
     
     def _check_position_status(self) -> None:
@@ -1365,8 +1474,11 @@ class LiveTrader:
         logger.info(f"  Take Profit: ${order['take_profit']:.2f}")
         
         try:
-            sl_ticks = int(abs(order['risk_ticks']))
-            tp_ticks = int(abs(order['reward_ticks']))
+            import math
+            # Use ceil() for SL (safer - ensures we don't shrink the stop distance)
+            # Use round() for TP (balanced - maintains R:R closer to planned)
+            sl_ticks = math.ceil(abs(order['risk_ticks']))
+            tp_ticks = round(abs(order['reward_ticks']))
             
             result = self.client.place_bracket_order(
                 contract_id=self.contract.id,
@@ -1838,8 +1950,53 @@ class LiveTrader:
             logger.warning("No bar data available - skipping signal check")
             return
         
-        # Prepare data and merge zones (don't replace existing zones)
-        df = self.strategy.prepare_data(df, merge_zones=True)
+        # Update rolling DataFrame with new bars
+        if self.rolling_df is None:
+            # First time - initialize with fetched bars
+            self.rolling_df = df.copy()
+        else:
+            # Append new bars to rolling DataFrame
+            # Find new bars (not already in rolling_df)
+            if len(self.rolling_df) > 0:
+                last_timestamp = self.rolling_df['timestamp'].iloc[-1]
+                new_bars = df[df['timestamp'] > last_timestamp].copy()
+            else:
+                new_bars = df.copy()
+            
+            if not new_bars.empty:
+                # Append new bars
+                self.rolling_df = pd.concat([self.rolling_df, new_bars], ignore_index=True)
+                # Keep only last N bars to prevent memory growth
+                if len(self.rolling_df) > self.rolling_df_max_bars:
+                    self.rolling_df = self.rolling_df.iloc[-self.rolling_df_max_bars:].reset_index(drop=True)
+        
+        # Update zones only periodically (every N bars or every 15 minutes)
+        should_update_zones = False
+        if self.last_zone_update_bars is None:
+            should_update_zones = True  # First update
+        else:
+            bars_since_update = len(self.rolling_df) - self.last_zone_update_bars
+            time_since_update = None
+            if self.last_zone_update_time:
+                time_since_update = (datetime.now(self.timezone) - self.last_zone_update_time).total_seconds() / 60
+            
+            if bars_since_update >= self.zone_update_interval_bars:
+                should_update_zones = True
+                logger.info(f"Zone update triggered: {bars_since_update} new bars since last update")
+            elif time_since_update and time_since_update >= 15:
+                should_update_zones = True
+                logger.info(f"Zone update triggered: {time_since_update:.1f} minutes since last update")
+        
+        if should_update_zones:
+            # Prepare data and merge zones (don't replace existing zones)
+            self.rolling_df = self.strategy.prepare_data(self.rolling_df, merge_zones=True)
+            self.last_zone_update_bars = len(self.rolling_df)
+            self.last_zone_update_time = datetime.now(self.timezone)
+            logger.debug(f"Zones updated from rolling DataFrame ({len(self.rolling_df)} bars)")
+        
+        # Add indicators to current df for signal generation (zones already in zone_manager)
+        if 'atr' not in df.columns:
+            df = self.strategy.indicators.add_indicators_to_df(df)
         
         # Check for broken zones and convert them (role reversal)
         if len(df) > 0:

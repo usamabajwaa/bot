@@ -1,0 +1,11 @@
+{
+  "total_replay_files": 25,
+  "premature_signals": 25,
+  "premature_percentage": 100.0,
+  "avg_seconds_before_completion": 180.0,
+  "max_seconds_before_completion": 180.0,
+  "avg_bar_age_at_signal": 0.0,
+  "min_bar_age_at_signal": 0.0,
+  "max_bar_age_at_signal": 0.0,
+  "bar_interval_seconds": 180
+}

@@ -21,6 +21,49 @@
     "max_wait_bars": 4,
     "entry_offset_ticks": 1
   },
+  "_comment_new_features": "=== NEW FEATURES ADDED ===",
+  "zone_age": {
+    "decay_hours": 48,
+    "min_weight": 0.1,
+    "fresh_hours": 24
+  },
+  "zone_clustering": {
+    "enabled": true,
+    "threshold_atr_mult": 0.5
+  },
+  "volume_profile": {
+    "enabled": false,
+    "hvn_threshold": 0.7,
+    "prefer_lvn_entries": true,
+    "hvn_buffer_ticks": 5
+  },
+  "order_flow": {
+    "enabled": false,
+    "min_imbalance": 0.2
+  },
+  "market_regime": {
+    "enabled": false,
+    "avoid_volatile": true,
+    "require_trend_alignment": false
+  },
+  "entry_timing": {
+    "require_consolidation": false,
+    "consolidation_bars": 3,
+    "min_bars_in_zone": 0
+  },
+  "dynamic_sizing": {
+    "enabled": false,
+    "base_contracts": 3,
+    "max_contracts": 5,
+    "min_contracts": 1,
+    "high_confidence_threshold": 0.8,
+    "low_confidence_threshold": 0.5
+  },
+  "correlation_filter": {
+    "enabled": false,
+    "symbols": ["ES", "NQ", "YM"],
+    "min_alignment": 2
+  },
   "sessions": {
     "asia": {
       "enabled": true,
@@ -90,7 +133,14 @@
     "structure_based": true,
     "structure_buffer_ticks": 3,
     "liquidity_sweep_buffer_ticks": 10,
-    "post_partial_sl_lock_r": 0.8
+    "post_partial_sl_lock_r": 0.8,
+    "_comment": "NEW: Gradual scale-out support",
+    "scale_out_mode": "standard",
+    "scale_out_levels": [
+      {"r": 1.0, "pct": 0.33, "move_be": true},
+      {"r": 2.0, "pct": 0.33, "trail_r": 0.5},
+      {"r": 0, "pct": 0.34, "target": "structure"}
+    ]
   },
   "trailing_stop": {
     "enabled": true,
@@ -130,5 +180,11 @@
     "enabled": true,
     "train_pct": 0.7,
     "test_pct": 0.3
+  },
+  "execution_mode": {
+    "execution_model": "ideal_close",
+    "manage_trade": true,
+    "live_like": false,
+    "fill_based_brackets": false
   }
 }

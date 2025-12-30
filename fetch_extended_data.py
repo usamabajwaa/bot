@@ -54,7 +54,8 @@ def fetch_contract_data(
                 end_time=current_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 count=20000,
                 live=False,
-                unit=2
+                unit=2,
+                include_partial=False  # Explicitly exclude partial bars
             )
             
             if bars:

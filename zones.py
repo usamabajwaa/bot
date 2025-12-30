@@ -1,9 +1,12 @@
 import pandas as pd
 import json
+import numpy as np
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+from datetime import datetime, timedelta
+import pytz
 
 
 class ZoneType(Enum):
@@ -24,12 +27,44 @@ class Zone:
     touch_count: int = 0
     is_active: bool = True
     last_touch_index: Optional[int] = None
+    # NEW: Zone age and quality metrics
+    volume_at_zone: float = 0.0  # Volume when zone was created
+    move_away_strength: float = 0.0  # How fast price moved away (imbalance indicator)
+    bars_in_zone: int = 0  # How many bars price spent in zone (consolidation)
+    quality_score: float = 1.0  # Combined quality score (0-1)
     
     def center(self) -> float:
         return (self.low + self.high) / 2
     
     def width(self) -> float:
         return self.high - self.low
+    
+    def age_hours(self, current_time: pd.Timestamp = None) -> float:
+        """Calculate zone age in hours"""
+        if current_time is None:
+            current_time = pd.Timestamp.now(tz=pytz.UTC)
+        if self.created_time.tzinfo is None:
+            created = pytz.UTC.localize(self.created_time)
+        else:
+            created = self.created_time.astimezone(pytz.UTC)
+        if current_time.tzinfo is None:
+            current_time = pytz.UTC.localize(current_time)
+        delta = current_time - created
+        return delta.total_seconds() / 3600
+    
+    def age_weight(self, current_time: pd.Timestamp = None, decay_hours: float = 48) -> float:
+        """Calculate age-based weight (fresher zones get higher weight)"""
+        age = self.age_hours(current_time)
+        # Exponential decay: zones older than decay_hours get significantly lower weight
+        # Fresh zones (< 24 hours) get weight close to 1.0
+        weight = np.exp(-age / decay_hours)
+        return max(0.1, min(1.0, weight))  # Clamp between 0.1 and 1.0
+    
+    def combined_score(self, current_time: pd.Timestamp = None) -> float:
+        """Combined score considering age, confidence, and quality"""
+        age_w = self.age_weight(current_time)
+        # Weights: 40% age, 30% confidence, 30% quality
+        return 0.4 * age_w + 0.3 * self.confidence + 0.3 * self.quality_score
 
 
 class ZoneManager:
@@ -46,6 +81,26 @@ class ZoneManager:
         
         self.tick_size = config.get('tick_size', 0.10)
         
+        # NEW: Zone age and quality settings
+        zone_age_config = config.get('zone_age', {})
+        self.age_decay_hours = zone_age_config.get('decay_hours', 48)
+        self.min_age_weight = zone_age_config.get('min_weight', 0.1)
+        self.fresh_zone_hours = zone_age_config.get('fresh_hours', 24)
+        
+        # NEW: Zone clustering settings
+        cluster_config = config.get('zone_clustering', {})
+        self.clustering_enabled = cluster_config.get('enabled', True)
+        self.cluster_threshold_atr = cluster_config.get('threshold_atr_mult', 0.5)
+        
+        # NEW: Volume profile settings
+        vp_config = config.get('volume_profile', {})
+        self.volume_weighting_enabled = vp_config.get('enabled', False)
+        self.hvn_threshold = vp_config.get('hvn_threshold', 0.7)  # Top 30% by volume
+        
+        # Track last zone build time for smart rebuilding
+        self.last_build_time: Optional[pd.Timestamp] = None
+        self.zones_built_today: bool = False
+        
     def create_zone_from_pivot(
         self,
         pivot_type: str,
@@ -53,7 +108,10 @@ class ZoneManager:
         atr: float,
         zone_atr_mult: float,
         pivot_index: int,
-        pivot_time: pd.Timestamp
+        pivot_time: pd.Timestamp,
+        volume: float = 0.0,
+        move_away_strength: float = 0.0,
+        bars_in_zone: int = 0
     ) -> Zone:
         zone_half_width = zone_atr_mult * atr
         
@@ -68,6 +126,9 @@ class ZoneManager:
         
         self.zone_counter += 1
         
+        # Calculate quality score based on move away strength and volume
+        quality_score = self._calculate_zone_quality(volume, move_away_strength, bars_in_zone, atr)
+        
         zone = Zone(
             zone_id=self.zone_counter,
             zone_type=zone_type,
@@ -75,11 +136,38 @@ class ZoneManager:
             high=zone_high,
             pivot_price=pivot_price,
             created_index=pivot_index,
-            created_time=pivot_time
+            created_time=pivot_time,
+            volume_at_zone=volume,
+            move_away_strength=move_away_strength,
+            bars_in_zone=bars_in_zone,
+            quality_score=quality_score
         )
         
         self.zones.append(zone)
         return zone
+    
+    def _calculate_zone_quality(
+        self,
+        volume: float,
+        move_away_strength: float,
+        bars_in_zone: int,
+        atr: float
+    ) -> float:
+        """Calculate zone quality based on various factors"""
+        quality = 1.0
+        
+        # Fast move away = strong zone (imbalance)
+        if atr > 0 and move_away_strength > 0:
+            move_factor = min(move_away_strength / atr, 2.0) / 2.0  # Normalize to 0-1
+            quality *= (0.5 + 0.5 * move_factor)  # Weight 0.5-1.0
+        
+        # Less time in zone = stronger zone (supply/demand imbalance was clear)
+        if bars_in_zone > 0:
+            # 1-2 bars is ideal, more than 5 is weak
+            time_factor = max(0, 1 - (bars_in_zone - 1) * 0.15)
+            quality *= max(0.3, time_factor)
+        
+        return min(1.0, max(0.1, quality))
     
     def update_zones_from_pivots(
         self,
@@ -309,6 +397,96 @@ class ZoneManager:
             'invalidated': len(self.zones) - active_demand - active_supply
         }
     
+    def cluster_nearby_zones(self, atr: float) -> int:
+        """Merge nearby zones of the same type into single stronger zones"""
+        if not self.clustering_enabled or atr <= 0:
+            return 0
+        
+        threshold = self.cluster_threshold_atr * atr
+        merged_count = 0
+        
+        for zone_type in [ZoneType.DEMAND, ZoneType.SUPPLY]:
+            active_zones = [z for z in self.zones if z.is_active and z.zone_type == zone_type]
+            
+            # Sort by center price
+            active_zones.sort(key=lambda z: z.center())
+            
+            i = 0
+            while i < len(active_zones) - 1:
+                zone1 = active_zones[i]
+                zone2 = active_zones[i + 1]
+                
+                # Check if zones are close enough to merge
+                distance = abs(zone1.center() - zone2.center())
+                if distance < threshold:
+                    # Merge: keep the higher quality zone, expand its range
+                    if zone1.combined_score() >= zone2.combined_score():
+                        keeper, remove = zone1, zone2
+                    else:
+                        keeper, remove = zone2, zone1
+                    
+                    # Expand keeper to encompass both zones
+                    keeper.low = min(zone1.low, zone2.low)
+                    keeper.high = max(zone1.high, zone2.high)
+                    keeper.pivot_price = (zone1.pivot_price + zone2.pivot_price) / 2
+                    keeper.volume_at_zone += remove.volume_at_zone
+                    keeper.quality_score = max(zone1.quality_score, zone2.quality_score)
+                    
+                    # Deactivate the removed zone
+                    remove.is_active = False
+                    merged_count += 1
+                    
+                    # Update list and continue from same position
+                    active_zones.remove(remove)
+                else:
+                    i += 1
+        
+        return merged_count
+    
+    def get_fresh_zones(
+        self,
+        zone_type: Optional[ZoneType] = None,
+        current_time: pd.Timestamp = None
+    ) -> List[Zone]:
+        """Get zones created within fresh_zone_hours (default 24 hours)"""
+        if current_time is None:
+            current_time = pd.Timestamp.now(tz=pytz.UTC)
+        
+        zones = self.get_active_zones(zone_type)
+        return [z for z in zones if z.age_hours(current_time) <= self.fresh_zone_hours]
+    
+    def get_high_quality_zones(
+        self,
+        zone_type: Optional[ZoneType] = None,
+        min_score: float = 0.6,
+        current_time: pd.Timestamp = None
+    ) -> List[Zone]:
+        """Get zones with combined score above threshold"""
+        zones = self.get_active_zones(zone_type)
+        return [z for z in zones if z.combined_score(current_time) >= min_score]
+    
+    def should_rebuild_zones(self, current_time: pd.Timestamp = None) -> bool:
+        """Check if zones should be rebuilt (once per day or never built)"""
+        if self.last_build_time is None:
+            return True
+        
+        if current_time is None:
+            current_time = pd.Timestamp.now(tz=pytz.UTC)
+        
+        # Rebuild if it's a new day
+        if current_time.date() != self.last_build_time.date():
+            self.zones_built_today = False
+            return True
+        
+        return False
+    
+    def mark_zones_built(self, current_time: pd.Timestamp = None):
+        """Mark that zones have been built for today"""
+        if current_time is None:
+            current_time = pd.Timestamp.now(tz=pytz.UTC)
+        self.last_build_time = current_time
+        self.zones_built_today = True
+    
     def save_zones(self, filepath: str = 'zones.json') -> bool:
         """Save zones to disk for persistence"""
         try:
@@ -376,16 +554,47 @@ class ZoneManager:
             return False
     
     def merge_zones(self, other_zones: List[Zone], current_max_index: int = 0) -> None:
-        """Merge zones from another source, avoiding duplicates"""
-        existing_pivot_prices = {z.pivot_price for z in self.zones}
+        """Merge zones from another source, avoiding duplicates using tolerance + range signature"""
         
+        def get_zone_signature(zone: Zone) -> tuple:
+            """Create a signature for zone deduplication using tolerance + range"""
+            # Round to tick_size buckets to handle float precision issues
+            pivot_bucket = round(zone.pivot_price / self.tick_size)
+            low_bucket = round(zone.low / self.tick_size)
+            high_bucket = round(zone.high / self.tick_size)
+            return (zone.zone_type, pivot_bucket, low_bucket, high_bucket)
+        
+        # Build signature map of existing zones
+        existing_signatures = {}
+        for zone in self.zones:
+            sig = get_zone_signature(zone)
+            if sig not in existing_signatures:
+                existing_signatures[sig] = zone
+            else:
+                # If duplicate signature, keep zone with higher confidence or more recent
+                existing = existing_signatures[sig]
+                if (zone.confidence > existing.confidence or 
+                    (zone.confidence == existing.confidence and zone.created_index > existing.created_index)):
+                    existing_signatures[sig] = zone
+        
+        # Merge new zones
         for zone in other_zones:
-            # Only add zones that don't already exist (by pivot price)
-            if zone.pivot_price not in existing_pivot_prices:
-                # Adjust zone indices if needed (for live trading where indices are relative)
-                # Keep original created_index for zones from historical data
+            sig = get_zone_signature(zone)
+            
+            if sig not in existing_signatures:
+                # New zone - add it
                 self.zones.append(zone)
-                existing_pivot_prices.add(zone.pivot_price)
+                existing_signatures[sig] = zone
+            else:
+                # Duplicate signature - keep zone with higher confidence or more recent
+                existing = existing_signatures[sig]
+                if (zone.confidence > existing.confidence or 
+                    (zone.confidence == existing.confidence and zone.created_index > existing.created_index)):
+                    # Replace existing zone with better one
+                    if existing in self.zones:
+                        self.zones.remove(existing)
+                    self.zones.append(zone)
+                    existing_signatures[sig] = zone
         
         # Update zone_counter to avoid ID conflicts
         if self.zones:

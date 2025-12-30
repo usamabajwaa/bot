@@ -1,12 +1,15 @@
 import pandas as pd
 from datetime import datetime, time, timedelta
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, TYPE_CHECKING
 from dataclasses import dataclass
 from enum import Enum
 import pytz
 
 from indicators import Indicators
 from zones import ZoneManager, ZoneType, Zone
+
+if TYPE_CHECKING:
+    from zones import Zone
 
 
 class SignalType(Enum):
@@ -31,6 +34,11 @@ class Signal:
     confirmation_type: str
     zone_confidence: float
     structure_levels: List[float] = None
+    # NEW: Enhanced signal fields
+    zone_combined_score: float = 0.0  # Zone age + confidence + quality score
+    suggested_position_size: int = 3  # Dynamic position size
+    market_regime: str = 'unknown'  # Current market regime
+    volume_profile_level: str = 'neutral'  # hvn, lvn, poc, or neutral
 
 
 class SessionManager:
@@ -158,8 +166,47 @@ class Strategy:
         vwap_obstruction_config = config.get('vwap_obstruction', {})
         self.vwap_obstruction_enabled = vwap_obstruction_config.get('enabled', False)
         
+        # NEW: Order Flow Analysis settings
+        order_flow_config = config.get('order_flow', {})
+        self.use_order_flow = order_flow_config.get('enabled', False)
+        self.order_flow_min_imbalance = order_flow_config.get('min_imbalance', 0.2)
+        
+        # NEW: Market Regime settings
+        regime_config = config.get('market_regime', {})
+        self.use_regime_filter = regime_config.get('enabled', False)
+        self.avoid_volatile_regime = regime_config.get('avoid_volatile', True)
+        self.require_trend_alignment = regime_config.get('require_trend_alignment', False)
+        
+        # NEW: Volume Profile settings
+        vp_config = config.get('volume_profile', {})
+        self.use_volume_profile = vp_config.get('enabled', False)
+        self.prefer_lvn_entries = vp_config.get('prefer_lvn_entries', True)
+        self.hvn_buffer_ticks = vp_config.get('hvn_buffer_ticks', 5)
+        
+        # NEW: Entry Timing settings
+        entry_timing_config = config.get('entry_timing', {})
+        self.require_consolidation = entry_timing_config.get('require_consolidation', False)
+        self.consolidation_bars = entry_timing_config.get('consolidation_bars', 3)
+        self.min_bars_in_zone = entry_timing_config.get('min_bars_in_zone', 2)
+        
+        # NEW: Dynamic Position Sizing settings
+        sizing_config = config.get('dynamic_sizing', {})
+        self.use_dynamic_sizing = sizing_config.get('enabled', False)
+        self.base_contracts = sizing_config.get('base_contracts', 3)
+        self.max_contracts = sizing_config.get('max_contracts', 5)
+        self.min_contracts = sizing_config.get('min_contracts', 1)
+        self.high_confidence_threshold = sizing_config.get('high_confidence_threshold', 0.8)
+        self.low_confidence_threshold = sizing_config.get('low_confidence_threshold', 0.5)
+        
+        # NEW: Correlation Filter settings
+        correlation_config = config.get('correlation_filter', {})
+        self.use_correlation_filter = correlation_config.get('enabled', False)
+        self.correlation_symbols = correlation_config.get('symbols', ['ES', 'NQ', 'YM'])
+        self.min_correlation_alignment = correlation_config.get('min_alignment', 2)
+        
         self.blackout_dates = set()
         self.htf_data = None
+        self.volume_profile = None  # Cached volume profile
         
     def load_blackout_dates(self, filepath: str) -> None:
         try:
@@ -326,6 +373,225 @@ class Strategy:
         current_volume = df['volume'].iloc[bar_index]
         return current_volume >= avg_volume * self.volume_min_mult
     
+    # ========================================
+    # NEW: Order Flow Alignment Check
+    # ========================================
+    
+    def check_order_flow(
+        self,
+        df: pd.DataFrame,
+        side: str,
+        bar_index: int = None
+    ) -> bool:
+        """Check if order flow aligns with trade direction"""
+        if not self.use_order_flow:
+            return True
+        
+        return self.indicators.check_order_flow_alignment(
+            df, side, bar_index, self.order_flow_min_imbalance
+        )
+    
+    # ========================================
+    # NEW: Market Regime Check
+    # ========================================
+    
+    def check_market_regime(
+        self,
+        df: pd.DataFrame,
+        side: str,
+        bar_index: int = None
+    ) -> Tuple[bool, str]:
+        """
+        Check if market regime is suitable for trading.
+        
+        Returns (passed, regime)
+        """
+        if not self.use_regime_filter:
+            return True, 'unknown'
+        
+        if bar_index is None:
+            bar_index = len(df) - 1
+        
+        regime = df['market_regime'].iloc[bar_index] if 'market_regime' in df.columns else 'unknown'
+        
+        # Avoid volatile regime if configured
+        if self.avoid_volatile_regime and regime == 'volatile':
+            return False, regime
+        
+        # Require trend alignment if configured
+        if self.require_trend_alignment:
+            if side == 'long' and regime not in ['trending_up', 'ranging', 'unknown']:
+                return False, regime
+            if side == 'short' and regime not in ['trending_down', 'ranging', 'unknown']:
+                return False, regime
+        
+        return True, regime
+    
+    # ========================================
+    # NEW: Volume Profile Zone Check
+    # ========================================
+    
+    def check_volume_profile_entry(
+        self,
+        df: pd.DataFrame,
+        entry_price: float,
+        bar_index: int = None
+    ) -> Tuple[bool, str]:
+        """
+        Check if entry is at a favorable volume profile level.
+        
+        Returns (passed, level_type) where level_type is 'hvn', 'lvn', 'poc', or 'neutral'
+        """
+        if not self.use_volume_profile:
+            return True, 'neutral'
+        
+        # Compute or use cached volume profile
+        if self.volume_profile is None:
+            self.volume_profile = self.indicators.compute_volume_profile(df, lookback_bars=200)
+        
+        if self.volume_profile['poc'] is None:
+            return True, 'neutral'
+        
+        # Check if near HVN (potential support/resistance)
+        if self.indicators.is_near_hvn(entry_price, self.volume_profile, self.hvn_buffer_ticks):
+            return True, 'hvn'
+        
+        # Check if near LVN (low volume - good for entries, price moves quickly through)
+        if self.indicators.is_near_lvn(entry_price, self.volume_profile, self.hvn_buffer_ticks):
+            # LVN entries are preferred - price should move quickly through
+            return True, 'lvn'
+        
+        # Not near any significant level
+        return True, 'neutral'
+    
+    # ========================================
+    # NEW: Entry Timing Check
+    # ========================================
+    
+    def check_entry_timing(
+        self,
+        df: pd.DataFrame,
+        zone: 'Zone',
+        bar_index: int = None
+    ) -> Tuple[bool, str]:
+        """
+        Check if entry timing is favorable.
+        
+        Returns (passed, reason)
+        """
+        if bar_index is None:
+            bar_index = len(df) - 1
+        
+        reasons = []
+        passed = True
+        
+        # Check consolidation requirement
+        if self.require_consolidation:
+            is_consolidating = self.indicators.is_consolidating(
+                df, bar_index, self.consolidation_bars
+            )
+            if not is_consolidating:
+                passed = False
+                reasons.append('no_consolidation')
+        
+        # Check minimum bars in zone
+        if self.min_bars_in_zone > 0:
+            bars_in_zone = self.indicators.count_bars_in_zone(
+                df, zone.low, zone.high, bar_index, lookback_bars=10
+            )
+            if bars_in_zone < self.min_bars_in_zone:
+                passed = False
+                reasons.append(f'bars_in_zone={bars_in_zone}<{self.min_bars_in_zone}')
+        
+        return passed, ','.join(reasons) if reasons else 'ok'
+    
+    # ========================================
+    # NEW: Dynamic Position Sizing
+    # ========================================
+    
+    def calculate_position_size(
+        self,
+        zone: 'Zone',
+        session: str,
+        current_time: pd.Timestamp = None
+    ) -> int:
+        """
+        Calculate dynamic position size based on confidence factors.
+        
+        Returns number of contracts to trade.
+        """
+        if not self.use_dynamic_sizing:
+            return self.base_contracts
+        
+        # Start with base contracts
+        size = self.base_contracts
+        
+        # Factor 1: Zone combined score (age + confidence + quality)
+        zone_score = zone.combined_score(current_time)
+        
+        # Factor 2: Session confidence
+        session_confidence = self._get_session_confidence(session)
+        
+        # Combined confidence
+        combined_confidence = 0.5 * zone_score + 0.5 * session_confidence
+        
+        # Adjust size based on confidence
+        if combined_confidence >= self.high_confidence_threshold:
+            # High confidence: increase size
+            size = min(self.max_contracts, self.base_contracts + 1)
+        elif combined_confidence <= self.low_confidence_threshold:
+            # Low confidence: decrease size
+            size = max(self.min_contracts, self.base_contracts - 1)
+        
+        return size
+    
+    def _get_session_confidence(self, session: str) -> float:
+        """Get session-based confidence score"""
+        # Based on historical performance by session
+        session_scores = {
+            'london': 0.85,    # Best performance historically
+            'us': 0.70,        # Good performance
+            'asia': 0.55,      # Lower performance
+            'london_early': 0.60
+        }
+        return session_scores.get(session, 0.65)
+    
+    # ========================================
+    # NEW: Correlation Filter (placeholder)
+    # ========================================
+    
+    def check_correlation_alignment(
+        self,
+        side: str,
+        correlation_data: dict = None
+    ) -> bool:
+        """
+        Check if correlated markets (ES, NQ, YM) align with trade direction.
+        
+        Args:
+            side: 'long' or 'short'
+            correlation_data: Dict with symbol -> trend direction
+                             e.g. {'ES': 'bullish', 'NQ': 'bullish', 'YM': 'bearish'}
+        
+        Returns True if enough correlated markets align.
+        """
+        if not self.use_correlation_filter:
+            return True
+        
+        if correlation_data is None:
+            # No correlation data available, allow trade
+            return True
+        
+        aligned_count = 0
+        expected_trend = 'bullish' if side == 'long' else 'bearish'
+        
+        for symbol in self.correlation_symbols:
+            if symbol in correlation_data:
+                if correlation_data[symbol] == expected_trend:
+                    aligned_count += 1
+        
+        return aligned_count >= self.min_correlation_alignment
+    
     def is_vwap_obstructing(
         self,
         entry_price: float,
@@ -449,11 +715,28 @@ class Strategy:
                     take_profit = level
                     break
             
-            if self.check_vwap_obstruction_enabled and entry_price < vwap < take_profit:
-                if structure_levels and structure_levels[0] < vwap:
-                    take_profit = structure_levels[0]
+            # Use is_vwap_obstructing() method for consistent VWAP obstruction logic
+            if self.is_vwap_obstructing(entry_price, take_profit, vwap, side):
+                # Option B: Cap TP to just before VWAP by buffer ticks, or use structure level if available
+                if structure_levels:
+                    # Find first structure level before VWAP
+                    for level in structure_levels:
+                        if level < vwap:
+                            take_profit = level
+                            break
+                    else:
+                        # No structure level before VWAP - cap TP to VWAP minus buffer
+                        vwap_buffer_ticks = 2  # Small buffer to avoid VWAP
+                        take_profit = vwap - (vwap_buffer_ticks * self.tick_size)
+                        # Ensure TP still meets min R:R
+                        if take_profit < min_tp:
+                            return None, None, None, None
                 else:
-                    return None, None, None, None
+                    # No structure levels - cap TP to VWAP minus buffer
+                    vwap_buffer_ticks = 2
+                    take_profit = vwap - (vwap_buffer_ticks * self.tick_size)
+                    if take_profit < min_tp:
+                        return None, None, None, None
             
             reward = take_profit - entry_price
             
@@ -477,11 +760,28 @@ class Strategy:
                     take_profit = level
                     break
             
-            if self.check_vwap_obstruction_enabled and take_profit < vwap < entry_price:
-                if structure_levels and structure_levels[0] > vwap:
-                    take_profit = structure_levels[0]
+            # Use is_vwap_obstructing() method for consistent VWAP obstruction logic
+            if self.is_vwap_obstructing(entry_price, take_profit, vwap, side):
+                # Option B: Cap TP to just before VWAP by buffer ticks, or use structure level if available
+                if structure_levels:
+                    # Find first structure level that's below VWAP (for shorts, we want TP below VWAP)
+                    for level in structure_levels:
+                        if level < vwap:
+                            take_profit = level
+                            break
+                    else:
+                        # No structure level below VWAP - cap TP to VWAP minus buffer
+                        vwap_buffer_ticks = 2  # Small buffer to avoid VWAP
+                        take_profit = vwap - (vwap_buffer_ticks * self.tick_size)
+                        # Ensure TP still meets min R:R (for shorts, TP must be <= min_tp)
+                        if take_profit > min_tp:
+                            return None, None, None, None
                 else:
-                    return None, None, None, None
+                    # No structure levels - cap TP to VWAP minus buffer
+                    vwap_buffer_ticks = 2
+                    take_profit = vwap - (vwap_buffer_ticks * self.tick_size)
+                    if take_profit > min_tp:
+                        return None, None, None, None
             
             reward = entry_price - take_profit
         
@@ -508,6 +808,13 @@ class Strategy:
         bar = df.iloc[bar_index]
         prev_bar = df.iloc[bar_index - 1]
         timestamp = pd.Timestamp(bar['timestamp'])
+        
+        # Normalize timestamp to tz-aware UTC at the top (consistent timezone handling)
+        if timestamp.tzinfo is None:
+            timestamp = pytz.UTC.localize(timestamp)
+        else:
+            timestamp = timestamp.astimezone(pytz.UTC)
+        
         price = bar['close']
         
         if debug_log:
@@ -624,6 +931,19 @@ class Strategy:
         filter_results['htf_filter_long'] = self.check_htf_filter(timestamp, 'long')
         filter_results['htf_filter_short'] = self.check_htf_filter(timestamp, 'short')
         
+        # NEW: Check market regime
+        regime_passed, current_regime = self.check_market_regime(df, 'long', bar_index)
+        filter_results['market_regime'] = current_regime
+        filter_results['regime_filter'] = regime_passed
+        
+        # NEW: Check order flow for both directions
+        filter_results['order_flow_long'] = self.check_order_flow(df, 'long', bar_index)
+        filter_results['order_flow_short'] = self.check_order_flow(df, 'short', bar_index)
+        
+        # NEW: Compute volume profile if enabled (cached)
+        if self.use_volume_profile and self.volume_profile is None:
+            self.volume_profile = self.indicators.compute_volume_profile(df, lookback_bars=200)
+        
         # Check chop filter with session-specific threshold
         if not filter_results['chop_filter']:
             if debug_log:
@@ -665,17 +985,23 @@ class Strategy:
             if debug_log and touched_zones:
                 for z in touched_zones:
                     conf_status = "HIGH" if z.confidence >= self.zone_manager.min_confidence else "LOW"
-                    print(f"      Zone @ ${z.pivot_price:.2f} (${z.low:.2f}-${z.high:.2f}), confidence={z.confidence:.2f} [{conf_status}]")
+                    age = z.age_hours(timestamp) if hasattr(z, 'age_hours') else 0
+                    combined = z.combined_score(timestamp) if hasattr(z, 'combined_score') else z.confidence
+                    print(f"      Zone @ ${z.pivot_price:.2f} (${z.low:.2f}-${z.high:.2f}), conf={z.confidence:.2f}, age={age:.1f}h, score={combined:.2f} [{conf_status}]")
             
             if not high_conf_zones:
                 if debug_log:
                     print(f"    -> No high-confidence zones (min={self.zone_manager.min_confidence})")
                 continue
             
-            zone = self.zone_manager.get_most_recent_zone(high_conf_zones)
+            # NEW: Prefer high-quality fresh zones
+            # Sort by combined score (age + confidence + quality) and pick best
+            high_conf_zones.sort(key=lambda z: z.combined_score(timestamp) if hasattr(z, 'combined_score') else z.confidence, reverse=True)
+            zone = high_conf_zones[0]  # Pick highest combined score
+            
             if zone is None:
                 if debug_log:
-                    print(f"    -> No most recent zone selected")
+                    print(f"    -> No zone selected")
                 continue
             
             if debug_log:
@@ -688,6 +1014,27 @@ class Strategy:
                     reversal_note = " (reversal zone)" if is_reversal else ""
                     print(f"    -> VWAP filter failed: price ${price:.2f} {'<' if side=='long' else '>'} VWAP ${vwap:.2f}{reversal_note}")
                 continue
+            
+            # NEW: Check order flow alignment
+            order_flow_key = f'order_flow_{side}'
+            if not filter_results.get(order_flow_key, True):
+                if debug_log:
+                    print(f"    -> Order flow filter failed: no {side} bias")
+                continue
+            
+            # NEW: Check market regime
+            if not filter_results.get('regime_filter', True):
+                if debug_log:
+                    print(f"    -> Market regime filter failed: {filter_results.get('market_regime', 'unknown')}")
+                continue
+            
+            # NEW: Check entry timing (consolidation, bars in zone)
+            timing_passed, timing_reason = self.check_entry_timing(df, zone, bar_index)
+            if not timing_passed:
+                if debug_log:
+                    print(f"    -> Entry timing filter failed: {timing_reason}")
+                continue
+            filter_results['entry_timing'] = timing_reason
             
             confirmed, confirm_type = self.check_confirmation(
                 bar, prev_bar, zone, side
@@ -752,6 +1099,16 @@ class Strategy:
             # Add VWAP filter result (check with zone context)
             filter_results['vwap_filter'] = self.check_vwap_filter(bar, vwap, side, zone)
             
+            # NEW: Calculate dynamic position size
+            suggested_size = self.calculate_position_size(zone, session, timestamp)
+            
+            # NEW: Get zone combined score
+            zone_combined = zone.combined_score(timestamp) if hasattr(zone, 'combined_score') else zone.confidence
+            
+            # NEW: Check volume profile level
+            vp_passed, vp_level = self.check_volume_profile_entry(df, entry_price, bar_index)
+            filter_results['volume_profile'] = vp_level
+            
             # Attach indicator values and filter results to signal for logging
             signal = Signal(
                 signal_type=SignalType.LONG if side == 'long' else SignalType.SHORT,
@@ -767,7 +1124,12 @@ class Strategy:
                 rr_ratio=rr_ratio,
                 confirmation_type=confirm_type,
                 zone_confidence=zone.confidence,
-                structure_levels=structure_levels
+                structure_levels=structure_levels,
+                # NEW fields
+                zone_combined_score=zone_combined,
+                suggested_position_size=suggested_size,
+                market_regime=filter_results.get('market_regime', 'unknown'),
+                volume_profile_level=vp_level
             )
             
             # Store indicator values and filter results as attributes for later use

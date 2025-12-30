@@ -130,5 +130,11 @@
     "enabled": true,
     "train_pct": 0.7,
     "test_pct": 0.3
+  },
+  "execution_mode": {
+    "execution_model": "ideal_close",
+    "manage_trade": true,
+    "live_like": false,
+    "fill_based_brackets": false
   }
 }

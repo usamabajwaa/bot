@@ -74,6 +74,28 @@ class BacktestEngine:
         
         df = self.strategy.prepare_data(self.data)
         
+        # Execution mode configuration (for backtest parity with live)
+        exec_mode = self.config.get('execution_mode', {})
+        execution_model = exec_mode.get('execution_model', 'ideal_close')  # ideal_close, market_slippage, fill_based
+        manage_trade = exec_mode.get('manage_trade', True)  # Enable BE/trailing/partial
+        live_like = exec_mode.get('live_like', False)  # Match live execution exactly
+        
+        # Override risk manager settings based on execution mode
+        if not manage_trade:
+            # Disable trade management features for signal quality comparison
+            self.risk_manager.break_even_enabled = False
+            self.risk_manager.partial_enabled = False
+            self.risk_manager.trailing_enabled = False
+            print("Execution mode: Trade management disabled (BE/trailing/partial off)")
+        
+        if execution_model == 'ideal_close':
+            # Use close price (no slippage)
+            self.risk_manager.slippage_ticks = 0
+            print("Execution mode: Ideal close (no slippage)")
+        elif execution_model == 'market_slippage':
+            # Use configured slippage
+            print(f"Execution mode: Market with slippage ({self.risk_manager.slippage_ticks} ticks)")
+        
         # Check if limit order retest is enabled
         limit_order_enabled = self.config.get('limit_order_retest', {}).get('enabled', False)
         entry_offset_ticks = self.config.get('limit_order_retest', {}).get('entry_offset_ticks', 1)
