@@ -9,7 +9,7 @@
   "commission_per_contract": 0.62,
   "slippage_ticks": 1,
   "max_trades_per_day": 9999,
-  "daily_loss_limit": -1500,
+  "daily_loss_limit": -2500,
   "blocked_days": [],
   "blocked_hours_utc": [],
   "long_trend_filter": {

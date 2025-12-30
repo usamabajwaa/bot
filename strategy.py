@@ -84,10 +84,11 @@ class SessionManager:
         timestamp: pd.Timestamp,
         session_name: str
     ) -> bool:
+        # Keep timestamp in UTC (session times are defined as UTC)
         if timestamp.tzinfo is None:
-            timestamp = self.tz.localize(timestamp)
+            timestamp = pytz.UTC.localize(timestamp)
         else:
-            timestamp = timestamp.astimezone(self.tz)
+            timestamp = timestamp.astimezone(pytz.UTC)
         
         session_config = self.sessions.get(session_name)
         if not session_config:
@@ -95,11 +96,12 @@ class SessionManager:
         
         start = self.parse_time(session_config['start'])
         end = self.parse_time(session_config['end'])
-        current_time = timestamp.time()
+        current_time = timestamp.time()  # Already UTC
         
-        start_dt = datetime.combine(timestamp.date(), start)
-        end_dt = datetime.combine(timestamp.date(), end)
-        current_dt = datetime.combine(timestamp.date(), current_time)
+        # All datetime operations in UTC
+        start_dt = datetime.combine(timestamp.date(), start, tzinfo=pytz.UTC)
+        end_dt = datetime.combine(timestamp.date(), end, tzinfo=pytz.UTC)
+        current_dt = datetime.combine(timestamp.date(), current_time, tzinfo=pytz.UTC)
         
         buffer = timedelta(minutes=self.buffer_minutes)
         
@@ -180,9 +182,12 @@ class Strategy:
         blocked_hours = self.config.get('blocked_hours_utc', [])
         if not blocked_hours:
             return False
-        utc_hour = timestamp.hour
-        if timestamp.tzinfo is not None:
-            utc_hour = timestamp.utc.hour if hasattr(timestamp, 'utc') else timestamp.tz_convert('UTC').hour
+        # Explicitly normalize to UTC
+        if timestamp.tzinfo is None:
+            ts_utc = pytz.UTC.localize(timestamp)
+        else:
+            ts_utc = timestamp.astimezone(pytz.UTC)
+        utc_hour = ts_utc.hour
         return utc_hour in blocked_hours
     
     def prepare_data(self, df: pd.DataFrame, merge_zones: bool = False) -> pd.DataFrame:
@@ -193,16 +198,21 @@ class Strategy:
             df: DataFrame with market data
             merge_zones: If True, merge new zones with existing ones instead of replacing
         """
+        import sys
+        print(f"Preparing data: {len(df)} bars...", file=sys.stderr)
         df = df.copy()
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df = df.sort_values('timestamp').reset_index(drop=True)
         
+        print("  Calculating indicators...", file=sys.stderr)
         df = self.indicators.add_indicators_to_df(df)
         
+        print("  Detecting pivots...", file=sys.stderr)
         pivot_highs, pivot_lows = self.indicators.detect_all_pivots(df, self.pivot_strength)
         
-        session_params = self.session_manager.get_session_params('us')
-        zone_atr_mult = session_params.get('zone_atr_mult', 0.25)
+        # Use global config for zone building instead of always using 'us' session
+        # This ensures consistent zones regardless of which session is active
+        zone_atr_mult = self.config.get('zone_atr_mult', 0.3)  # Global default
         
         if merge_zones:
             # Create temporary zone manager to get new zones
@@ -410,10 +420,14 @@ class Strategy:
         atr: float,
         session_params: dict,
         bar_index: int,
-        vwap: float
+        vwap: float,
+        min_rr: float = None
     ) -> Tuple[float, float, float, float]:
         sl_buffer_mult = session_params.get('sl_buffer_atr_mult', 0.15)
         buffer = max(sl_buffer_mult * atr, self.min_sl_ticks * self.tick_size)
+        
+        # Use passed min_rr (session-specific) or fall back to global
+        effective_min_rr = min_rr if min_rr is not None else self.min_rr
         
         if side == 'long':
             stop_loss = zone.low - buffer
@@ -422,7 +436,7 @@ class Strategy:
             if risk <= 0:
                 return None, None, None, None
             
-            min_tp = entry_price + self.min_rr * risk
+            min_tp = entry_price + effective_min_rr * risk
             
             structure_levels = self.find_structure_levels(
                 entry_price, side, bar_index, min_distance=risk * 0.5
@@ -450,7 +464,7 @@ class Strategy:
             if risk <= 0:
                 return None, None, None, None
             
-            min_tp = entry_price - self.min_rr * risk
+            min_tp = entry_price - effective_min_rr * risk
             
             structure_levels = self.find_structure_levels(
                 entry_price, side, bar_index, min_distance=risk * 0.5
@@ -529,7 +543,7 @@ class Strategy:
             return None
         
         max_trades = self.config.get('max_trades_per_day', 6)
-        daily_limit = self.config.get('daily_loss_limit', -800)
+        daily_limit = self.config.get('daily_loss_limit', -2500)
         
         if daily_trades >= max_trades:
             if debug_log:
@@ -603,18 +617,24 @@ class Strategy:
             if session_filters:
                 print(f"  -> Session-specific filters: min_rr={effective_min_rr}, chop_max={effective_chop_max}, require_volume={effective_require_volume}, require_both={effective_require_both}")
         
+        # Track filter results for logging (initialize before checks)
+        filter_results = {}
+        filter_results['chop_filter'] = self.check_chop_filter(df, df['vwap'], bar_index, max_crosses=effective_chop_max)
+        filter_results['volume_filter'] = self.check_volume_filter(df, bar_index) if effective_require_volume else True
+        filter_results['htf_filter_long'] = self.check_htf_filter(timestamp, 'long')
+        filter_results['htf_filter_short'] = self.check_htf_filter(timestamp, 'short')
+        
         # Check chop filter with session-specific threshold
-        if not self.check_chop_filter(df, df['vwap'], bar_index, max_crosses=effective_chop_max):
+        if not filter_results['chop_filter']:
             if debug_log:
                 print(f"  -> BLOCKED: Chop filter failed (too many VWAP crosses, max={effective_chop_max})")
             return None
         
         # Check volume filter with session-specific requirement
-        if effective_require_volume:
-            if not self.check_volume_filter(df, bar_index):
-                if debug_log:
-                    print(f"  -> BLOCKED: Volume filter failed (low volume, required for this session)")
-                return None
+        if effective_require_volume and not filter_results['volume_filter']:
+            if debug_log:
+                print(f"  -> BLOCKED: Volume filter failed (low volume, required for this session)")
+            return None
         
         for side, zone_type in [('long', ZoneType.DEMAND), ('short', ZoneType.SUPPLY)]:
             if debug_log:
@@ -623,7 +643,9 @@ class Strategy:
             # Check VWAP filter after we have the zone (for reversal exceptions)
             # We'll check it again after zone selection
             
-            if not self.check_htf_filter(timestamp, side):
+            # Use pre-computed HTF filter result
+            htf_passed = filter_results['htf_filter_long'] if side == 'long' else filter_results['htf_filter_short']
+            if not htf_passed:
                 if debug_log:
                     print(f"    -> HTF filter failed: 15-min trend doesn't align")
                 continue
@@ -686,7 +708,7 @@ class Strategy:
                 entry_price = bar['close'] - slippage
             
             sl, tp, risk, reward = self.calculate_sl_tp(
-                entry_price, zone, side, atr, session_params, bar_index, vwap
+                entry_price, zone, side, atr, session_params, bar_index, vwap, min_rr=effective_min_rr
             )
             
             if sl is None or tp is None:
@@ -721,7 +743,17 @@ class Strategy:
                 entry_price, side, bar_index, min_distance=risk * 0.3
             )
             
-            return Signal(
+            # Get indicator values and VWAP filter result for logging
+            indicator_values = {
+                'vwap': vwap,
+                'atr': atr,
+                'ema': bar.get('ema', 0) if 'ema' in bar else 0
+            }
+            # Add VWAP filter result (check with zone context)
+            filter_results['vwap_filter'] = self.check_vwap_filter(bar, vwap, side, zone)
+            
+            # Attach indicator values and filter results to signal for logging
+            signal = Signal(
                 signal_type=SignalType.LONG if side == 'long' else SignalType.SHORT,
                 entry_price=entry_price,
                 stop_loss=sl,
@@ -737,6 +769,12 @@ class Strategy:
                 zone_confidence=zone.confidence,
                 structure_levels=structure_levels
             )
+            
+            # Store indicator values and filter results as attributes for later use
+            signal.indicator_values = indicator_values
+            signal.filter_results = filter_results
+            
+            return signal
         
         return None
     

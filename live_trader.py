@@ -14,14 +14,45 @@ from alerts import AlertManager, load_alert_config
 from zones import ZoneType
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('live_trading.log'),
-        logging.StreamHandler()
-    ]
-)
+# Configure logging only once - prevent duplicate handlers
+# This is critical to avoid duplicate log entries (was causing 12 entries instead of 3)
+root_logger = logging.getLogger()
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# Check if handlers already exist for our log file
+has_file_handler = False
+has_stream_handler = False
+
+for handler in root_logger.handlers:
+    if isinstance(handler, logging.FileHandler):
+        try:
+            # Check if this is our log file handler
+            if hasattr(handler, 'baseFilename') and 'live_trading.log' in str(handler.baseFilename):
+                has_file_handler = True
+        except (AttributeError, TypeError):
+            pass
+    elif isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+        has_stream_handler = True
+
+# Remove ALL existing handlers to prevent duplicates, then add fresh ones
+# This ensures we have exactly one of each handler type
+for handler in root_logger.handlers[:]:  # Copy list to avoid modification during iteration
+    root_logger.removeHandler(handler)
+    if hasattr(handler, 'close'):
+        handler.close()
+
+# Add exactly one file handler and one stream handler
+file_handler = logging.FileHandler('live_trading.log')
+file_handler.setFormatter(formatter)
+root_logger.addHandler(file_handler)
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+root_logger.addHandler(stream_handler)
+
+# Set level
+root_logger.setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,7 +87,7 @@ class LiveTrader:
         
         self.timezone = pytz.timezone(self.config.get('timezone', 'America/Chicago'))
         self.position_size = self.config.get('position_size_contracts', 5)
-        self.daily_loss_limit = self.config.get('daily_loss_limit', -1500)
+        self.daily_loss_limit = self.config.get('daily_loss_limit', -2500)
         self.max_trades_per_day = self.config.get('max_trades_per_day', 4)
         self.tick_size = self.config.get('tick_size', 0.10)
         self.tick_value = self.config.get('tick_value', 1.0)
@@ -92,6 +123,7 @@ class LiveTrader:
         self.pending_orders: Dict[int, Dict] = {}
         self.pending_limit_order: Optional[Dict] = None  # For limit order retest
         self._executing_entry = False  # Lock to prevent concurrent entry execution
+        self._trading_locked = False  # Lock to prevent new signals/trades while position is open
         
         self.daily_trades = 0
         self.daily_pnl = 0.0
@@ -116,6 +148,17 @@ class LiveTrader:
         self.cooldown_minutes = pause_bars * bar_interval_minutes
         self.consecutive_losses = 0
         self.cooldown_until: Optional[datetime] = None
+        
+        # Replay mode: save bars when signals are generated
+        self.save_replay_data = True  # Configurable flag
+        self.replay_data_dir = Path('replay_data')  # Separate folder for replay files
+        self.replay_data_dir.mkdir(exist_ok=True)
+        self.max_replay_files = 200  # Keep only last 200 replay files
+        
+        # Replay mode: save bars when signals are generated
+        self.save_replay_data = True  # Configurable flag
+        self.replay_data_dir = Path('replay_data')
+        self.replay_data_dir.mkdir(exist_ok=True)
         
     def _load_config(self, path: str) -> dict:
         with open(path, 'r') as f:
@@ -419,6 +462,9 @@ class LiveTrader:
         if position.size == 0 and self.current_position:
             logger.info("Position closed")
             self.current_position = None
+            # Release trading lock when position closes
+            self._trading_locked = False
+            logger.info("Trading lock released - new signals allowed")
     
     def _on_trade(self, trade: UserTrade):
         logger.info(f"Trade: {trade.size} @ {trade.price} P&L: ${trade.pnl:.2f}")
@@ -532,16 +578,27 @@ class LiveTrader:
             now = datetime.now(timezone.utc)
             start_time = now - timedelta(days=2)
             
-            logger.info(f"Fetching recent bars (last {count} bars, {bar_interval_minutes}-minute interval)...")
+            # Calculate minimum bars needed for indicator warmup
+            # ATR(14), EMA(20), VWAP needs ~50 bars minimum, add buffer for safety
+            atr_period = 14
+            ema_period = 20
+            vwap_lookback = 50  # Conservative estimate
+            min_bars = max(atr_period, ema_period, vwap_lookback) * 3  # 3x for safety = 150
+            min_bars = max(min_bars, 500)  # Ensure at least 500 bars
+            
+            # Use max of requested count and minimum
+            actual_count = max(count, min_bars)
+            logger.info(f"Fetching {actual_count} bars (minimum {min_bars} for indicator warmup, {bar_interval_minutes}-minute interval)...")
             
             bars = self.client.get_historical_bars(
                 contract_id=self.contract.id,
                 interval=bar_interval_minutes,  # Match backtest data interval (3-minute bars)
                 start_time=start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 end_time=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                count=count,
+                count=actual_count,
                 live=False,
-                unit=2
+                unit=2,
+                include_partial=False  # Explicitly exclude partial bars
             )
             
             if not bars:
@@ -555,7 +612,36 @@ class LiveTrader:
             
             # Parse timestamps - TopStep API returns UTC timestamps (ISO format with Z or Unix milliseconds)
             df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-            df = df.sort_values('timestamp').reset_index(drop=True)
+            df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+            
+            # Detect gaps in data
+            if len(df) > 1:
+                df['time_diff'] = df['timestamp'].diff()
+                expected_interval = pd.Timedelta(seconds=bar_interval_seconds)
+                gap_threshold = expected_interval * 1.5
+                
+                gaps = df[df['time_diff'] > gap_threshold]
+                if not gaps.empty:
+                    for idx, row in gaps.iterrows():
+                        gap_duration = row['time_diff'].total_seconds() / 60
+                        logger.warning(f"Gap detected: {gap_duration:.1f} minutes between bars at {row['timestamp']}")
+                
+                df = df.drop(columns=['time_diff'])
+            
+            # Exclude last bar if potentially incomplete (less than 1.5 bar intervals old)
+            if len(df) > 0:
+                last_bar_time = pd.to_datetime(df['timestamp'].iloc[-1])
+                if last_bar_time.tzinfo is None:
+                    last_bar_time = pytz.UTC.localize(last_bar_time)
+                else:
+                    last_bar_time = last_bar_time.astimezone(pytz.UTC)
+                
+                time_since_last_bar = (now - last_bar_time).total_seconds()
+                min_bar_age = bar_interval_seconds * 1.5  # 270 seconds for 3-min bars
+                
+                if time_since_last_bar < min_bar_age:
+                    logger.info(f"Excluding potentially incomplete bar: {time_since_last_bar:.0f}s old (< {min_bar_age:.0f}s threshold)")
+                    df = df.iloc[:-1].copy()
             
             # Validate data freshness
             if len(df) > 0:
@@ -598,29 +684,25 @@ class LiveTrader:
         timestamp = pd.Timestamp(last_bar['timestamp'])
         price = last_bar['close']
         
-        # Log signal check attempt with UTC time for clarity
+        # Ensure timestamp is UTC for consistent session detection
         if timestamp.tzinfo is None:
             timestamp_utc = pytz.UTC.localize(timestamp)
         else:
             timestamp_utc = timestamp.astimezone(pytz.UTC)
         
-        # Use current time for session detection to avoid stale bar timestamp issues
-        current_time_utc = pd.Timestamp.now(tz=pytz.UTC)
-        logger.info(f"Signal check: Bar time={timestamp_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}, Current time={current_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}, Price=${price:.2f}")
+        # Check if bar is stale (use bar timestamp, not current time, for session detection)
+        now_utc = pd.Timestamp.now(tz=pytz.UTC)
+        bar_age_seconds = (now_utc - timestamp_utc).total_seconds()
+        stale_threshold_seconds = 180 * 3  # 9 minutes (3 bar intervals)
         
-        session = self.strategy.session_manager.get_active_session(current_time_utc)
-        if session:
-            logger.info(f"  Session: {session}")
-        else:
-            utc_hour = timestamp_utc.hour
-            # Get all enabled sessions for logging
-            enabled_sessions = []
-            for sess_name, sess_config in self.strategy.session_manager.sessions.items():
-                if sess_config.get('enabled', True):
-                    enabled_sessions.append(f"{sess_name}: {sess_config['start']}-{sess_config['end']} UTC")
-            sessions_str = ", ".join(enabled_sessions) if enabled_sessions else "none"
-            logger.info(f"  -> No active session (Current UTC hour: {utc_hour:02d}:00, enabled sessions: {sessions_str})")
+        if bar_age_seconds > stale_threshold_seconds:
+            logger.warning(f"Bar is stale: {bar_age_seconds:.0f}s old (>{stale_threshold_seconds}s threshold)")
             return None
+        
+        logger.info(f"Signal check: Bar time={timestamp_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}, Price=${price:.2f}")
+        
+        # Let strategy.generate_signal() handle session detection based on bar timestamp
+        # Don't pre-check session here to avoid timestamp mismatches
         
         # Check zone availability
         active_demand = len([z for z in self.strategy.zone_manager.zones if z.is_active and z.zone_type == ZoneType.DEMAND])
@@ -665,6 +747,10 @@ class LiveTrader:
             logger.info(f"  -> No signal generated (filters: VWAP, HTF, chop, volume, confirmation, zones, R:R)")
             return None
         
+        # Save bars for replay if enabled
+        if self.save_replay_data:
+            self._save_replay_data(df, signal)
+        
         rr_ratio = signal.reward_ticks / signal.risk_ticks if signal.risk_ticks > 0 else 0
         logger.info(f"SIGNAL GENERATED: {signal.signal_type.value.upper()} @ ${signal.entry_price:.2f}, SL=${signal.stop_loss:.2f}, TP=${signal.take_profit:.2f}, R:R={rr_ratio:.2f}")
         return {
@@ -678,6 +764,46 @@ class LiveTrader:
             'structure_levels': signal.structure_levels or [],
             'zone': signal.zone
         }
+    
+    def _save_replay_data(self, df: pd.DataFrame, signal) -> None:
+        """Save bars around signal for realistic replay backtesting"""
+        # Save last 500 bars (enough for full context and indicator warmup)
+        save_df = df.iloc[-500:].copy() if len(df) > 500 else df.copy()
+        
+        timestamp_str = signal.timestamp.strftime('%Y%m%d_%H%M%S')
+        filename = self.replay_data_dir / f"replay_{timestamp_str}_{signal.signal_type.value}.csv"
+        save_df.to_csv(filename, index=False)
+        logger.info(f"Saved replay data: {filename} ({len(save_df)} bars)")
+        
+        # Keep only last 200 replay files (cleanup older ones)
+        self._cleanup_old_replay_files()
+    
+    def _cleanup_old_replay_files(self) -> None:
+        """Remove old replay files, keeping only the most recent max_replay_files"""
+        try:
+            # Get all replay CSV files
+            replay_files = list(self.replay_data_dir.glob('replay_*.csv'))
+            
+            if len(replay_files) <= self.max_replay_files:
+                return  # No cleanup needed
+            
+            # Sort by modification time (newest first)
+            replay_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+            
+            # Delete files beyond the limit
+            files_to_delete = replay_files[self.max_replay_files:]
+            deleted_count = 0
+            for file in files_to_delete:
+                try:
+                    file.unlink()
+                    deleted_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to delete old replay file {file}: {e}")
+            
+            if deleted_count > 0:
+                logger.info(f"Cleaned up {deleted_count} old replay files (keeping last {self.max_replay_files})")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup old replay files: {e}")
     
     def _create_pending_limit_order(self, signal: Dict) -> None:
         """Create a pending limit order at the zone edge for retest entry."""
@@ -813,7 +939,8 @@ class LiveTrader:
                 self.alerts.error(f"Order failed: {error}")
                 # Clear position on failure
                 self.current_position = None
-                self._executing_entry = False  # Release lock
+                self._executing_entry = False  # Release execution lock
+                self._trading_locked = False  # Release trading lock
                 return False
             
             order_id = result.get('orderId')
@@ -829,23 +956,29 @@ class LiveTrader:
             
             logger.info(f"OK Order placed successfully. Order ID: {order_id}")
             
-            self.alerts.trade_entry(
-                side=signal['type'],
-                entry_price=signal['entry_price'],
-                quantity=self.position_size,
-                stop_loss=signal['stop_loss'],
-                take_profit=signal['take_profit']
-            )
+            # Send alert (non-blocking - wrap in try/except to prevent hanging)
+            try:
+                self.alerts.trade_entry(
+                    side=signal['type'],
+                    entry_price=signal['entry_price'],
+                    quantity=self.position_size,
+                    stop_loss=signal['stop_loss'],
+                    take_profit=signal['take_profit']
+                )
+            except Exception as e:
+                logger.warning(f"Alert failed (non-critical): {e}")
             
+            logger.info("Entry execution completed - releasing locks")
             self._executing_entry = False  # Release lock after successful order
             return True
             
         except Exception as e:
             logger.error(f"Order execution failed: {e}")
             self.alerts.error(f"Order execution failed: {e}")
-            # Clear position and release lock on exception
+            # Clear position and release locks on exception
             self.current_position = None
-            self._executing_entry = False
+            self._executing_entry = False  # Release execution lock
+            self._trading_locked = False  # Release trading lock
             return False
     
     def _check_position_status(self) -> None:
@@ -853,6 +986,9 @@ class LiveTrader:
             return
         
         try:
+            # Log that we're checking position status
+            logger.debug(f"Checking position status: {self.current_position.get('side', 'unknown')} {self.current_position.get('quantity', 0)} @ ${self.current_position.get('entry_price', 0):.2f}")
+            
             positions = self.client.get_positions()
             
             has_position = False
@@ -866,14 +1002,44 @@ class LiveTrader:
             if not has_position:
                 logger.info("Position closed (detected via REST)")
                 self.current_position = None
+                # Release trading lock when position closes
+                self._trading_locked = False
+                logger.info("Trading lock released - new signals allowed")
             elif broker_position:
                 # Sync position details from broker
-                if self.current_position.get('quantity') != abs(broker_position.size):
-                    logger.info(f"Position size synced: {self.current_position.get('quantity')} -> {abs(broker_position.size)}")
-                    self.current_position['quantity'] = abs(broker_position.size)
+                old_qty = self.current_position.get('quantity')
+                new_qty = abs(broker_position.size)
+                if old_qty != new_qty:
+                    logger.info(f"Position size synced: {old_qty} -> {new_qty}")
+                    self.current_position['quantity'] = new_qty
+                    # Update order sizes to match new position quantity
+                    self._sync_order_sizes_to_position()
+                else:
+                    # ALWAYS log position status when position exists (not just every 5th check)
+                    if not hasattr(self, '_position_check_count'):
+                        self._position_check_count = 0
+                    self._position_check_count += 1
+                    
+                    current_price = self._get_current_price()
+                    if current_price:
+                        entry = self.current_position.get('entry_price', 0)
+                        side = self.current_position.get('side', 'unknown')
+                        qty = self.current_position.get('quantity', 0)
+                        
+                        if side == 'long':
+                            pnl = (current_price - entry) * qty
+                            pnl_ticks = (current_price - entry) / self.tick_size
+                        else:
+                            pnl = (entry - current_price) * qty
+                            pnl_ticks = (entry - current_price) / self.tick_size
+                        
+                        # Log every position check to show trader is active
+                        logger.info(f"[POSITION] {side.upper()} {qty} @ ${entry:.2f}, Current: ${current_price:.2f}, P&L: ${pnl:.2f} ({pnl_ticks:.1f} ticks)")
                 
         except Exception as e:
             logger.error(f"Failed to check position: {e}")
+            import traceback
+            logger.error(f"Position check traceback: {traceback.format_exc()}")
     
     def _sync_position_from_broker(self, position: UserPosition) -> None:
         """Sync position state from broker when we detect orphaned position"""
@@ -909,6 +1075,8 @@ class LiveTrader:
                     if order.get('contractId') == self.contract.id:
                         if order.get('type') == 4:  # STOP order
                             self.current_position['stop_loss'] = order.get('stopPrice', position.average_price)
+                            self.current_position['stop_order_id'] = order.get('id')  # Store stop order ID
+                            logger.info(f"Found existing stop order: ID {order.get('id')} at ${order.get('stopPrice', 0):.2f}")
                         elif order.get('type') == 1:  # LIMIT order (could be TP)
                             if (side == 'long' and order.get('limitPrice', 0) > position.average_price) or \
                                (side == 'short' and order.get('limitPrice', 0) < position.average_price):
@@ -926,60 +1094,75 @@ class LiveTrader:
         if self.current_position is None:
             return
         
-        be_config = self.config.get('break_even', {})
-        if not be_config.get('enabled', True):
+        # Prevent concurrent calls with a lock
+        if hasattr(self, '_checking_break_even') and self._checking_break_even:
             return
         
-        if self.current_position.get('break_even_set'):
-            return
-        
-        current_price = self._get_current_price()
-        if current_price is None:
-            return
-        
-        entry = self.current_position['entry_price']
-        stop = self.current_position['stop_loss']
-        side = self.current_position['side']
-        risk = abs(entry - stop)
-        trigger_r = be_config.get('trigger_r', 1.0)
-        
-        should_move = False
-        reason = ""
-        
-        # Early BE based on ticks (moves to BE when trade goes X ticks in profit)
-        if self.early_be_enabled:
-            early_be_distance = self.early_be_ticks * self.tick_size
+        self._checking_break_even = True
+        try:
+            be_config = self.config.get('break_even', {})
+            if not be_config.get('enabled', True):
+                return
             
-            if side == 'long':
-                profit_distance = current_price - entry
-                if profit_distance >= early_be_distance and stop < entry:
-                    should_move = True
-                    reason = f"Early BE: {profit_distance/self.tick_size:.0f} ticks profit (threshold: {self.early_be_ticks} ticks)"
-            else:  # short
-                profit_distance = entry - current_price
-                if profit_distance >= early_be_distance and stop > entry:
-                    should_move = True
-                    reason = f"Early BE: {profit_distance/self.tick_size:.0f} ticks profit (threshold: {self.early_be_ticks} ticks)"
-        
-        # R-based BE (original logic)
-        if not should_move:
-            if side == 'long':
-                if current_price >= entry + (risk * trigger_r):
-                    if stop < entry:
+            # Check flag FIRST to prevent any duplicate processing
+            if self.current_position.get('break_even_set'):
+                return
+            
+            current_price = self._get_current_price()
+            if current_price is None:
+                return
+            
+            entry = self.current_position['entry_price']
+            stop = self.current_position['stop_loss']
+            side = self.current_position['side']
+            risk = abs(entry - stop)
+            trigger_r = be_config.get('trigger_r', 1.0)
+            
+            should_move = False
+            reason = ""
+            
+            # Early BE based on ticks (moves to BE when trade goes X ticks in profit)
+            if self.early_be_enabled:
+                early_be_distance = self.early_be_ticks * self.tick_size
+                
+                if side == 'long':
+                    profit_distance = current_price - entry
+                    if profit_distance >= early_be_distance and stop < entry:
                         should_move = True
-                        reason = f"R-based BE: {trigger_r}R profit"
-            else:
-                if current_price <= entry - (risk * trigger_r):
-                    if stop > entry:
+                        reason = f"Early BE: {profit_distance/self.tick_size:.0f} ticks profit (threshold: {self.early_be_ticks} ticks)"
+                else:  # short
+                    profit_distance = entry - current_price
+                    if profit_distance >= early_be_distance and stop > entry:
                         should_move = True
-                        reason = f"R-based BE: {trigger_r}R profit"
-        
-        if should_move:
-            logger.info(f"Moving stop to break-even: ${entry:.2f} ({reason})")
-            self.current_position['break_even_set'] = True
-            self.current_position['stop_loss'] = entry
-            self._update_stop_order(entry)  # Update broker stop order
-            self.alerts.stop_moved_to_breakeven(entry)
+                        reason = f"Early BE: {profit_distance/self.tick_size:.0f} ticks profit (threshold: {self.early_be_ticks} ticks)"
+            
+            # R-based BE (original logic)
+            if not should_move:
+                if side == 'long':
+                    if current_price >= entry + (risk * trigger_r):
+                        if stop < entry:
+                            should_move = True
+                            reason = f"R-based BE: {trigger_r}R profit"
+                else:
+                    if current_price <= entry - (risk * trigger_r):
+                        if stop > entry:
+                            should_move = True
+                            reason = f"R-based BE: {trigger_r}R profit"
+            
+            if should_move:
+                # Double-check flag AGAIN (race condition protection)
+                if self.current_position.get('break_even_set'):
+                    logger.debug("Break-even already set, skipping duplicate call")
+                    return
+                
+                # Set flag IMMEDIATELY to prevent other threads from processing
+                self.current_position['break_even_set'] = True
+                logger.info(f"Moving stop to break-even: ${entry:.2f} ({reason})")
+                self.current_position['stop_loss'] = entry
+                self._update_stop_order(entry)  # Update broker stop order
+                self.alerts.stop_moved_to_breakeven(entry)
+        finally:
+            self._checking_break_even = False
     
     def _calculate_unrealized_pnl(self, current_price: float) -> float:
         if self.current_position is None:
@@ -1196,7 +1379,8 @@ class LiveTrader:
             if not result.get('success'):
                 error = result.get('errorMessage', 'Unknown error')
                 logger.error(f"Limit entry failed: {error}")
-                self._executing_entry = False  # Release lock
+                self._executing_entry = False  # Release execution lock
+                self._trading_locked = False  # Release trading lock
                 return False
             
             order_id = result.get('orderId')
@@ -1233,9 +1417,10 @@ class LiveTrader:
             
         except Exception as e:
             logger.error(f"Limit entry execution failed: {e}")
-            # Clear position and release lock on exception
+            # Clear position and release locks on exception
             self.current_position = None
-            self._executing_entry = False
+            self._executing_entry = False  # Release execution lock
+            self._trading_locked = False  # Release trading lock
             return False
 
     def _execute_partial_exit(self, current_price: float) -> None:
@@ -1332,34 +1517,200 @@ class LiveTrader:
     
     def _update_stop_order(self, new_stop_price: float) -> None:
         try:
-            if 'stop_order_id' in self.current_position and self.current_position['stop_order_id']:
-                result = self.client.modify_order(
-                    order_id=self.current_position['stop_order_id'],
+            if self.current_position is None:
+                return
+            
+            # Prevent concurrent calls with a simple lock
+            if hasattr(self, '_updating_stop_order') and self._updating_stop_order:
+                logger.debug("Stop order update already in progress, skipping duplicate call")
+                return
+            
+            self._updating_stop_order = True
+            
+            try:
+                side = self.current_position['side']
+                current_price = self._get_current_price()
+                
+                # Round to tick size first
+                new_stop_price = round(new_stop_price / self.tick_size) * self.tick_size
+                
+                # Validate stop price
+                if current_price is not None:
+                    if side == 'long':
+                        # For LONG: stop must be below current price (or it would trigger immediately)
+                        if new_stop_price >= current_price:
+                            logger.warning(f"Invalid stop price for LONG: ${new_stop_price:.2f} >= current ${current_price:.2f}. Adjusting to ${current_price - self.tick_size:.2f}")
+                            new_stop_price = round((current_price - self.tick_size) / self.tick_size) * self.tick_size  # Place 1 tick below current
+                    else:  # short
+                        # For SHORT: stop must be above current price
+                        if new_stop_price <= current_price:
+                            logger.warning(f"Invalid stop price for SHORT: ${new_stop_price:.2f} <= current ${current_price:.2f}. Adjusting to ${current_price + self.tick_size:.2f}")
+                            new_stop_price = round((current_price + self.tick_size) / self.tick_size) * self.tick_size  # Place 1 tick above current
+                
+                # ALWAYS get fresh list of open orders first to find existing stop orders
+                existing_stop_order_id = None
+                all_stop_order_ids = []
+                try:
+                    open_orders = self.client.get_open_orders()
+                    for order in open_orders:
+                        if order.get('contractId') == self.contract.id and order.get('type') == 4:  # STOP order
+                            order_id = order.get('id')
+                            all_stop_order_ids.append(order_id)
+                            # Use the first one we find, or prefer the one we have stored
+                            if existing_stop_order_id is None:
+                                existing_stop_order_id = order_id
+                            if order_id == self.current_position.get('stop_order_id'):
+                                existing_stop_order_id = order_id  # Prefer stored ID
+                except Exception as e:
+                    logger.debug(f"Could not fetch open orders: {e}")
+                
+                # If we found an existing stop order, try to modify it
+                if existing_stop_order_id:
+                    # Update stored ID
+                    self.current_position['stop_order_id'] = existing_stop_order_id
+                    
+                    # Get current position quantity to update order size
+                    current_qty = self.current_position.get('quantity')
+                    if current_qty is None or current_qty <= 0:
+                        try:
+                            positions = self.client.get_positions()
+                            for pos in positions:
+                                if pos.contract_id == self.contract.id:
+                                    current_qty = abs(pos.size)
+                                    self.current_position['quantity'] = current_qty
+                                    break
+                        except Exception as e:
+                            logger.debug(f"Could not sync quantity: {e}")
+                    
+                    # Use current quantity or fallback to position_size
+                    if current_qty is None or current_qty <= 0:
+                        current_qty = self.position_size
+                    
+                    result = self.client.modify_order(
+                        order_id=existing_stop_order_id,
+                        size=current_qty,  # Update size to match position
+                        stop_price=new_stop_price
+                    )
+                    if result.get('success'):
+                        logger.info(f"Stop order modified: #{existing_stop_order_id} to ${new_stop_price:.2f}")
+                        # Cancel any other duplicate stop orders
+                        for other_id in all_stop_order_ids:
+                            if other_id != existing_stop_order_id:
+                                try:
+                                    logger.info(f"Cancelling duplicate stop order: ID {other_id}")
+                                    self.client.cancel_order(other_id)
+                                except Exception as e:
+                                    logger.warning(f"Failed to cancel duplicate stop order {other_id}: {e}")
+                        return
+                    else:
+                        error_msg = result.get('errorMessage', 'Unknown error')
+                        logger.warning(f"Modify failed: {error_msg}. Will cancel and place new order.")
+                
+                # If modify failed or no existing order, cancel ALL existing stop orders first
+                for stop_id in all_stop_order_ids:
+                    try:
+                        logger.info(f"Cancelling existing stop order: ID {stop_id}")
+                        self.client.cancel_order(stop_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel stop order {stop_id}: {e}")
+                
+                # Now place new stop order
+                stop_side = OrderSide.ASK if side == 'long' else OrderSide.BID
+                # ALWAYS use the actual position quantity, sync from broker if needed
+                remaining_qty = self.current_position.get('quantity')
+                if remaining_qty is None or remaining_qty <= 0:
+                    # Try to get actual quantity from broker
+                    try:
+                        positions = self.client.get_positions()
+                        for pos in positions:
+                            if pos.contract_id == self.contract.id:
+                                remaining_qty = abs(pos.size)
+                                self.current_position['quantity'] = remaining_qty
+                                logger.info(f"Synced position quantity from broker: {remaining_qty} contracts")
+                                break
+                    except Exception as e:
+                        logger.warning(f"Could not sync quantity from broker: {e}")
+                
+                # Fallback to position_size if still not set
+                if remaining_qty is None or remaining_qty <= 0:
+                    remaining_qty = self.position_size
+                    logger.warning(f"Using default position size: {remaining_qty} contracts (position quantity not set)")
+                
+                logger.info(f"Placing stop order: {stop_side.name} {remaining_qty} contracts @ ${new_stop_price:.2f}")
+                order = self.client.place_order(
+                    contract_id=self.contract.id,
+                    order_type=OrderType.STOP,
+                    side=stop_side,
+                    size=remaining_qty,
                     stop_price=new_stop_price
                 )
-                if result.get('success'):
-                    logger.info(f"Stop order modified: #{self.current_position['stop_order_id']} to ${new_stop_price:.2f}")
-                    return
-                else:
-                    logger.warning(f"Modify failed, placing new order: {result.get('errorMessage')}")
-            
-            side = self.current_position['side']
-            stop_side = OrderSide.ASK if side == 'long' else OrderSide.BID
-            remaining_qty = self.current_position.get('quantity', self.position_size)
-            
-            order = self.client.place_order(
-                contract_id=self.contract.id,
-                order_type=OrderType.STOP,
-                side=stop_side,
-                size=remaining_qty,
-                stop_price=new_stop_price
-            )
-            
-            if order and order.get('orderId'):
-                self.current_position['stop_order_id'] = order.get('orderId')
-                logger.info(f"New stop order placed: #{order.get('orderId')} at ${new_stop_price:.2f}")
+                
+                if order and order.get('orderId'):
+                    self.current_position['stop_order_id'] = order.get('orderId')
+                    logger.info(f"New stop order placed: #{order.get('orderId')} at ${new_stop_price:.2f}")
+                elif order and not order.get('success'):
+                    error_msg = order.get('errorMessage', 'Unknown error')
+                    logger.error(f"Failed to place stop order: {error_msg}")
+            finally:
+                self._updating_stop_order = False
         except Exception as e:
             logger.error(f"Failed to update stop order: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            if hasattr(self, '_updating_stop_order'):
+                self._updating_stop_order = False
+    
+    def _sync_order_sizes_to_position(self) -> None:
+        """Sync all open order sizes to match current position quantity"""
+        if self.current_position is None:
+            return
+        
+        current_qty = self.current_position.get('quantity')
+        if current_qty is None or current_qty <= 0:
+            return
+        
+        try:
+            open_orders = self.client.get_open_orders()
+            updated_count = 0
+            
+            for order in open_orders:
+                if order.get('contractId') != self.contract.id:
+                    continue
+                
+                order_id = order.get('id')
+                order_size = abs(order.get('size', 0))
+                order_type = order.get('type')
+                
+                # Only update stop and limit (TP) orders
+                if order_type in [1, 4]:  # LIMIT=1, STOP=4
+                    if order_size != current_qty:
+                        try:
+                            # Modify order to update size
+                            if order_type == 4:  # STOP
+                                result = self.client.modify_order(
+                                    order_id=order_id,
+                                    size=current_qty,
+                                    stop_price=order.get('stopPrice')
+                                )
+                            else:  # LIMIT (TP)
+                                result = self.client.modify_order(
+                                    order_id=order_id,
+                                    size=current_qty,
+                                    limit_price=order.get('limitPrice')
+                                )
+                            
+                            if result.get('success'):
+                                logger.info(f"Updated order #{order_id} size: {order_size} -> {current_qty} contracts")
+                                updated_count += 1
+                            else:
+                                logger.warning(f"Failed to update order #{order_id} size: {result.get('errorMessage')}")
+                        except Exception as e:
+                            logger.warning(f"Error updating order #{order_id} size: {e}")
+            
+            if updated_count > 0:
+                logger.info(f"Synced {updated_count} order(s) to position size: {current_qty} contracts")
+        except Exception as e:
+            logger.warning(f"Failed to sync order sizes: {e}")
     
     def _check_realtime_pnl(self, current_price: float) -> None:
         if self.current_position is None or self.daily_limit_triggered:
@@ -1398,17 +1749,23 @@ class LiveTrader:
         try:
             close_side = OrderSide.ASK if side == 'long' else OrderSide.BID
             
+            # Use remaining quantity, not initial size (in case of partial exits)
+            remaining_qty = self.current_position.get('quantity', self.position_size)
+            
             order = self.client.place_order(
                 contract_id=self.contract.id,
                 order_type=OrderType.MARKET,
                 side=close_side,
-                size=self.position_size
+                size=remaining_qty
             )
             
             if order:
                 logger.info(f"OK Force exit order placed: #{order.id}")
                 self.daily_pnl += unrealized_pnl
                 self.current_position = None
+                # Release trading lock when position closes
+                self._trading_locked = False
+                logger.info("Trading lock released - new signals allowed")
                 
                 self.alerts.error(f"Position closed. No more trades today. Final P&L: ${self.daily_pnl:.2f}")
                 return True
@@ -1441,6 +1798,24 @@ class LiveTrader:
         # CRITICAL: Check execution lock FIRST to prevent duplicate orders
         if self._executing_entry:
             logger.debug("Skipping run_once: Entry execution in progress")
+            return
+        
+        # CRITICAL: Check trading lock - prevent new signals while position is open
+        if self._trading_locked:
+            # When trading is locked, we still need to monitor the position
+            if self.current_position is not None:
+                logger.debug("Trading locked - monitoring position status")
+                self._check_position_status()
+                
+                if self.current_position is not None:
+                    if self._check_daily_loss_force_exit():
+                        return
+                    self._check_break_even()
+                    # Check trailing stop and partial profit using current price
+                    current_price = self._get_current_price()
+                    if current_price:
+                        self._update_trailing_stop(current_price)
+                        self._check_partial_profit(current_price)
             return
         
         if self.current_position is not None:
@@ -1496,9 +1871,13 @@ class LiveTrader:
         signal = self._check_for_signal(df)
         
         if signal:
-            # CRITICAL: Triple-check we don't have a position or pending execution
-            # This prevents race conditions when run_once() is called multiple times quickly
-            # Check execution lock FIRST (most important)
+            # CRITICAL: Multiple checks to prevent duplicate orders
+            # Check trading lock FIRST (prevents any new signals while position is open)
+            if self._trading_locked:
+                logger.warning(f"Signal generated but trading is locked (position is open) - skipping entry")
+                return
+            
+            # Check execution lock
             if self._executing_entry:
                 logger.warning(f"Signal generated but entry already in progress - skipping duplicate entry")
                 return
@@ -1511,9 +1890,10 @@ class LiveTrader:
                 logger.warning(f"Signal generated but pending limit order exists - skipping duplicate entry")
                 return
             
-            # Set execution lock IMMEDIATELY before calling _execute_entry
+            # Set BOTH locks IMMEDIATELY before calling _execute_entry
             # This prevents another run_once() call from getting past the checks
             self._executing_entry = True
+            self._trading_locked = True  # Lock trading until position closes
             
             try:
                 if self.limit_order_enabled:
@@ -1567,11 +1947,19 @@ class LiveTrader:
         logger.info("")
         
         try:
+            loop_count = 0
             while self.running:
                 try:
+                    loop_count += 1
+                    # Log every 10 loops (every ~5-10 minutes depending on interval) to show it's alive
+                    if loop_count % 10 == 0:
+                        logger.info(f"[HEARTBEAT] Trading loop active - iteration {loop_count}, position: {'OPEN' if self.current_position else 'NONE'}, locked: {self._trading_locked}")
+                    
                     self.run_once()
                 except Exception as e:
                     logger.error(f"Error in trading loop: {e}")
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
                     self.alerts.error(f"Trading loop error: {e}")
                 
                 time.sleep(interval_seconds)
@@ -1630,6 +2018,192 @@ class LiveTrader:
                 'ask': self.last_quote.best_ask
             } if self.last_quote else None
         }
+    
+    def test_trade(self, side: str = 'long', entry_price: float = None, quantity: int = 1) -> bool:
+        """
+        Place a test trade with 1 contract, bracket orders, partial exits, and break-even
+        
+        Args:
+            side: 'long' or 'short'
+            entry_price: Entry price (uses current market price if None)
+            quantity: Number of contracts (default 1 for testing)
+        
+        Returns:
+            True if trade placed successfully, False otherwise
+        """
+        if not self.contract:
+            logger.error("Cannot place test trade - no contract set")
+            return False
+        
+        if self.current_position is not None:
+            logger.warning(f"Cannot place test trade - position already exists: {self.current_position.get('side')} {self.current_position.get('quantity')}")
+            return False
+        
+        try:
+            # Get current price if entry_price not provided
+            if entry_price is None:
+                current_price = self._get_current_price()
+                if current_price is None:
+                    logger.error("Cannot place test trade - no current price available")
+                    return False
+                entry_price = current_price
+            
+            logger.info("=" * 70)
+            logger.info("PLACING TEST TRADE")
+            logger.info("=" * 70)
+            logger.info(f"Side: {side.upper()}")
+            logger.info(f"Entry Price: ${entry_price:.2f}")
+            logger.info(f"Quantity: {quantity} contract(s)")
+            
+            # Calculate test stop loss and take profit (sample values)
+            # For LONG: SL 10 ticks below, TP 30 ticks above
+            # For SHORT: SL 10 ticks above, TP 30 ticks below
+            if side == 'long':
+                stop_loss = round((entry_price - (10 * self.tick_size)) / self.tick_size) * self.tick_size
+                take_profit = round((entry_price + (30 * self.tick_size)) / self.tick_size) * self.tick_size
+            else:
+                stop_loss = round((entry_price + (10 * self.tick_size)) / self.tick_size) * self.tick_size
+                take_profit = round((entry_price - (30 * self.tick_size)) / self.tick_size) * self.tick_size
+            
+            logger.info(f"Stop Loss: ${stop_loss:.2f}")
+            logger.info(f"Take Profit: ${take_profit:.2f}")
+            logger.info(f"Risk: 10 ticks, Reward: 30 ticks, R:R = 3.0")
+            
+            # Place market order
+            order_side = OrderSide.BID if side == 'long' else OrderSide.ASK
+            logger.info(f"Placing {side.upper()} market order: {quantity} contracts @ ${entry_price:.2f}")
+            
+            order_result = self.client.place_order(
+                contract_id=self.contract.id,
+                side=order_side,
+                order_type=OrderType.MARKET,
+                size=quantity
+            )
+            
+            if not order_result or not order_result.get('success'):
+                error_msg = order_result.get('errorMessage', 'Unknown error') if order_result else 'No response'
+                logger.error(f"Failed to place test trade order: {error_msg}")
+                return False
+            
+            order_id = order_result.get('orderId')
+            if not order_id:
+                logger.error("Order placed but no order ID returned")
+                return False
+            
+            logger.info(f"Order placed: ID {order_id}")
+            
+            # Wait a moment for fill
+            import time
+            time.sleep(2)
+            
+            # Check if order was filled
+            positions = self.client.get_positions()
+            filled_position = None
+            for pos in positions:
+                if pos.contract_id == self.contract.id and pos.size != 0:
+                    filled_position = pos
+                    break
+            
+            if not filled_position:
+                logger.warning("Order placed but position not found - may need to wait longer")
+                return False
+            
+            actual_entry = filled_position.average_price
+            actual_qty = abs(filled_position.size)
+            logger.info(f"Position filled: {side.upper()} {actual_qty} @ ${actual_entry:.2f}")
+            
+            # Create position tracking
+            self.current_position = {
+                'side': side,
+                'entry_price': actual_entry,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'quantity': actual_qty,
+                'initial_quantity': actual_qty,
+                'risk_ticks': 10.0,
+                'reward_ticks': 30.0,
+                'session': 'test',
+                'test_trade': True
+            }
+            
+            # Set trading lock
+            self._trading_locked = True
+            self._executing_entry = False
+            
+            # Place bracket orders (stop loss and take profit)
+            logger.info("Placing bracket orders...")
+            
+            # Place stop loss order
+            stop_side = OrderSide.ASK if side == 'long' else OrderSide.BID
+            stop_order = self.client.place_order(
+                contract_id=self.contract.id,
+                side=stop_side,
+                order_type=OrderType.STOP,
+                size=actual_qty,
+                stop_price=stop_loss
+            )
+            
+            if stop_order and stop_order.get('success'):
+                stop_order_id = stop_order.get('orderId')
+                if stop_order_id:
+                    logger.info(f"Stop loss order placed: ID {stop_order_id} @ ${stop_loss:.2f}")
+                    self.pending_orders[stop_order_id] = {
+                        'type': 'stop_loss',
+                        'price': stop_loss
+                    }
+                else:
+                    logger.warning("Stop loss order placed but no order ID returned")
+            else:
+                error_msg = stop_order.get('errorMessage', 'Unknown error') if stop_order else 'No response'
+                logger.warning(f"Failed to place stop loss order: {error_msg}")
+            
+            # Place take profit order (partial exit at 1R, then move SL to BE)
+            # For test: exit 50% at 1R, keep 50% running
+            partial_qty = max(1, actual_qty // 2)  # At least 1 contract
+            remaining_qty = actual_qty - partial_qty
+            
+            tp_side = OrderSide.ASK if side == 'long' else OrderSide.BID
+            tp_order = self.client.place_order(
+                contract_id=self.contract.id,
+                side=tp_side,
+                order_type=OrderType.LIMIT,
+                size=partial_qty,
+                limit_price=take_profit
+            )
+            
+            if tp_order and tp_order.get('success'):
+                tp_order_id = tp_order.get('orderId')
+                if tp_order_id:
+                    logger.info(f"Take profit order placed: ID {tp_order_id} @ ${take_profit:.2f} ({partial_qty} contracts)")
+                    self.pending_orders[tp_order_id] = {
+                        'type': 'take_profit_partial',
+                        'price': take_profit,
+                        'quantity': partial_qty
+                    }
+                else:
+                    logger.warning("Take profit order placed but no order ID returned")
+            else:
+                error_msg = tp_order.get('errorMessage', 'Unknown error') if tp_order else 'No response'
+                logger.warning(f"Failed to place take profit order: {error_msg}")
+            
+            logger.info("=" * 70)
+            logger.info("TEST TRADE PLACED SUCCESSFULLY")
+            logger.info("=" * 70)
+            logger.info("Monitoring position for:")
+            logger.info("  - Partial exit at 1R (50% of position)")
+            logger.info("  - Break-even move after partial")
+            logger.info("  - Stop loss protection")
+            logger.info("=" * 70)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error placing test trade: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            self._executing_entry = False
+            self._trading_locked = False
+            return False
 
 
 def main():
@@ -1644,6 +2218,8 @@ def main():
                         help='Check interval in seconds')
     parser.add_argument('--test', action='store_true',
                         help='Test connection only, no trading')
+    parser.add_argument('--test-trade', type=str, choices=['long', 'short'],
+                        help='Place a test trade (long or short) with 1 contract')
     
     args = parser.parse_args()
     
@@ -1659,6 +2235,18 @@ def main():
             logger.info("\nConnection Status:")
             logger.info(json.dumps(status, indent=2, default=str))
             trader.stop()
+        return
+    
+    if args.test_trade:
+        logger.info("TEST TRADE MODE - Placing test trade")
+        if trader.connect():
+            success = trader.test_trade(side=args.test_trade, quantity=1)
+            if success:
+                logger.info("Test trade placed - starting monitoring loop")
+                trader.run(interval_seconds=args.interval)
+            else:
+                logger.error("Failed to place test trade")
+                trader.stop()
         return
     
     trader.run(interval_seconds=args.interval)

@@ -3,21 +3,14 @@ module.exports = {
     name: 'mgc-live-trader',
     script: 'live_trader.py',
     interpreter: 'python',
-    args: '--config config_production.json --credentials credentials.json --interval 30',
-    cwd: './',
+    args: '--config config_production.json',
     instances: 1,
     autorestart: true,
     watch: false,
-    max_memory_restart: '500M',
+    max_memory_restart: '1G',
     error_file: './logs/pm2-error.log',
     out_file: './logs/pm2-out.log',
     log_file: './logs/pm2-combined.log',
-    time: true,
-    merge_logs: true,
-    env: {
-      NODE_ENV: 'production',
-      PYTHONUNBUFFERED: '1'
-    }
+    time: true
   }]
 };
-

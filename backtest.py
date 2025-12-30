@@ -40,34 +40,25 @@ class BacktestEngine:
         has_contract_info = 'contract' in df.columns
         
         if has_contract_info:
-            # Data has contract info - verify it's TopStep MGC
+            # Data has contract info - verify it's from TopStep (MGC, SIL, etc.)
             topstep_contracts = df['contract'].unique()
-            if not any('CON.F.US.MGC' in str(c) for c in topstep_contracts):
-                raise ValueError("Data does not appear to be from TopStep MGC contracts. Please use fetch_extended_data.py to fetch TopStep data.")
+            valid_contracts = ['CON.F.US.MGC', 'CON.F.US.SIL', 'CON.F.US.SIE']
+            if not any(any(valid in str(c) for valid in valid_contracts) for c in topstep_contracts):
+                print(f"Warning: Data contracts {topstep_contracts} may not be from TopStep. Continuing anyway...")
         else:
-            # No contract column - check if data looks valid for MGC
-            if len(df) > 0:
-                # Check price range - MGC should be around $4000-5000 range
-                avg_price = df['close'].mean()
-                
-                if avg_price < 1000 or avg_price > 10000:
-                    raise ValueError(
-                        f"Data price range (${avg_price:.2f}) doesn't match MGC. "
-                        "Please fetch data from TopStep using: python fetch_extended_data.py --days 90 --interval 3"
-                    )
-                
-                # Warn if no contract info
-                import warnings
-                warnings.warn(
-                    "Data file missing 'contract' column. "
-                    "For best results, use fetch_extended_data.py to fetch TopStep data.",
-                    UserWarning
-                )
+            # No contract column - warn but continue
+            import warnings
+            warnings.warn(
+                "Data file missing 'contract' column. "
+                "For best results, use fetch_extended_data.py or fetch_silver_data.py to fetch TopStep data.",
+                UserWarning
+            )
         
         if 'volume' not in df.columns:
             df['volume'] = 1
         
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        # Ensure all timestamps are UTC timezone-aware
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
         df = df.sort_values('timestamp').reset_index(drop=True)
         
         self.data = df
@@ -171,6 +162,10 @@ class BacktestEngine:
                     )
             else:
                 # Immediate market order entry
+                # Get indicator values and filter results from signal if available
+                indicator_values = getattr(signal, 'indicator_values', None)
+                filter_results = getattr(signal, 'filter_results', None)
+                
                 self.risk_manager.open_position(
                     side=side,
                     entry_price=signal.entry_price,
@@ -183,7 +178,9 @@ class BacktestEngine:
                     confirmation_type=signal.confirmation_type,
                     risk_ticks=signal.risk_ticks,
                     reward_ticks=signal.reward_ticks,
-                    structure_levels=signal.structure_levels
+                    structure_levels=signal.structure_levels,
+                    indicator_values=indicator_values,
+                    filter_results=filter_results
                 )
         
         if self.risk_manager.current_position is not None:
@@ -264,10 +261,17 @@ class BacktestEngine:
         temp_strategy = Strategy(self.config)
         temp_risk = RiskManager(self.config)
         
+        print("Preparing data (calculating indicators)...")
         df = temp_strategy.prepare_data(data)
+        print(f"Data prepared: {len(df)} bars")
         results = []
         
+        total_bars = len(df)
+        print(f"Starting backtest on {total_bars} bars...")
+        
         for i in range(len(df)):
+            if i % 1000 == 0:
+                print(f"Progress: {i}/{total_bars} bars ({i*100//total_bars if total_bars > 0 else 0}%) - {len(results)} trades")
             bar = df.iloc[i]
             date = pd.Timestamp(bar['timestamp']).date()
             

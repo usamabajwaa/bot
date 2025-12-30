@@ -3850,7 +3850,7 @@
     },
     {
       "zone_id": 407,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4360.139244629457,
       "high": 4362.660755370543,
       "pivot_price": 4361.4,
@@ -3863,7 +3863,7 @@
     },
     {
       "zone_id": 408,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4366.696899295914,
       "high": 4369.303100704086,
       "pivot_price": 4368.0,
@@ -3876,7 +3876,7 @@
     },
     {
       "zone_id": 409,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4365.417462336604,
       "high": 4367.582537663396,
       "pivot_price": 4366.5,
@@ -3889,7 +3889,7 @@
     },
     {
       "zone_id": 410,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4364.539464506307,
       "high": 4366.860535493693,
       "pivot_price": 4365.7,
@@ -3902,7 +3902,7 @@
     },
     {
       "zone_id": 411,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4359.594742455125,
       "high": 4361.805257544875,
       "pivot_price": 4360.7,
@@ -3915,7 +3915,7 @@
     },
     {
       "zone_id": 412,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4354.90659435577,
       "high": 4357.693405644231,
       "pivot_price": 4356.3,
@@ -3928,7 +3928,7 @@
     },
     {
       "zone_id": 413,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4367.035840081912,
       "high": 4369.764159918087,
       "pivot_price": 4368.4,
@@ -3941,7 +3941,7 @@
     },
     {
       "zone_id": 414,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4364.968107311243,
       "high": 4368.431892688756,
       "pivot_price": 4366.7,
@@ -3954,7 +3954,7 @@
     },
     {
       "zone_id": 415,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4361.290270532075,
       "high": 4364.909729467926,
       "pivot_price": 4363.1,
@@ -3967,7 +3967,7 @@
     },
     {
       "zone_id": 416,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4371.471183805543,
       "high": 4375.728816194458,
       "pivot_price": 4373.6,
@@ -4188,7 +4188,7 @@
     },
     {
       "zone_id": 434,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4352.463813667214,
       "high": 4354.736186332787,
       "pivot_price": 4353.6,
@@ -4201,7 +4201,7 @@
     },
     {
       "zone_id": 435,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4352.816847054801,
       "high": 4354.7831529452,
       "pivot_price": 4353.8,
@@ -4227,7 +4227,7 @@
     },
     {
       "zone_id": 438,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4357.0072648803225,
       "high": 4358.392735119677,
       "pivot_price": 4357.7,
@@ -4240,7 +4240,7 @@
     },
     {
       "zone_id": 440,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4357.211198492658,
       "high": 4358.388801507343,
       "pivot_price": 4357.8,
@@ -4253,7 +4253,7 @@
     },
     {
       "zone_id": 441,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4371.133696756509,
       "high": 4373.066303243491,
       "pivot_price": 4372.1,
@@ -4266,7 +4266,7 @@
     },
     {
       "zone_id": 442,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4374.0360130914205,
       "high": 4375.56398690858,
       "pivot_price": 4374.8,
@@ -4279,7 +4279,7 @@
     },
     {
       "zone_id": 443,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4372.589892086298,
       "high": 4374.210107913701,
       "pivot_price": 4373.4,
@@ -4292,7 +4292,7 @@
     },
     {
       "zone_id": 444,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4365.937398153118,
       "high": 4367.862601846881,
       "pivot_price": 4366.9,
@@ -4305,7 +4305,7 @@
     },
     {
       "zone_id": 445,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4376.065539567509,
       "high": 4377.73446043249,
       "pivot_price": 4376.9,
@@ -4331,7 +4331,7 @@
     },
     {
       "zone_id": 447,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4373.415130257297,
       "high": 4375.184869742703,
       "pivot_price": 4374.3,
@@ -4344,7 +4344,7 @@
     },
     {
       "zone_id": 448,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4375.608204719174,
       "high": 4376.991795280826,
       "pivot_price": 4376.3,
@@ -4357,7 +4357,7 @@
     },
     {
       "zone_id": 449,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4370.93418927867,
       "high": 4373.06581072133,
       "pivot_price": 4372.0,
@@ -4370,7 +4370,7 @@
     },
     {
       "zone_id": 450,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4368.751176208186,
       "high": 4370.448823791815,
       "pivot_price": 4369.6,
@@ -4383,7 +4383,7 @@
     },
     {
       "zone_id": 451,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4369.382857949274,
       "high": 4371.217142050727,
       "pivot_price": 4370.3,
@@ -4396,7 +4396,7 @@
     },
     {
       "zone_id": 452,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4372.363384843701,
       "high": 4373.8366151563,
       "pivot_price": 4373.1,
@@ -4409,7 +4409,7 @@
     },
     {
       "zone_id": 453,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4366.033218566503,
       "high": 4368.566781433497,
       "pivot_price": 4367.3,
@@ -4422,7 +4422,7 @@
     },
     {
       "zone_id": 454,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4367.274264520954,
       "high": 4370.125735479046,
       "pivot_price": 4368.7,
@@ -4435,7 +4435,7 @@
     },
     {
       "zone_id": 455,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4351.144356869409,
       "high": 4354.455643130591,
       "pivot_price": 4352.8,
@@ -4942,7 +4942,7 @@
     },
     {
       "zone_id": 500,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4350.925483770214,
       "high": 4354.8745162297855,
       "pivot_price": 4352.9,
@@ -5163,7 +5163,7 @@
     },
     {
       "zone_id": 523,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4356.675102427876,
       "high": 4358.324897572124,
       "pivot_price": 4357.5,
@@ -5176,7 +5176,7 @@
     },
     {
       "zone_id": 524,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4360.799196509843,
       "high": 4363.000803490157,
       "pivot_price": 4361.9,
@@ -5189,7 +5189,7 @@
     },
     {
       "zone_id": 525,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4361.074462820038,
       "high": 4363.525537179962,
       "pivot_price": 4362.3,
@@ -5345,7 +5345,7 @@
     },
     {
       "zone_id": 538,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4362.97425592736,
       "high": 4366.02574407264,
       "pivot_price": 4364.5,
@@ -5358,7 +5358,7 @@
     },
     {
       "zone_id": 539,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4352.382858707169,
       "high": 4356.01714129283,
       "pivot_price": 4354.2,
@@ -5371,7 +5371,7 @@
     },
     {
       "zone_id": 540,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4357.654888088613,
       "high": 4362.345111911387,
       "pivot_price": 4360.0,
@@ -5384,7 +5384,7 @@
     },
     {
       "zone_id": 541,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4363.941818981848,
       "high": 4368.258181018153,
       "pivot_price": 4366.1,
@@ -5397,7 +5397,7 @@
     },
     {
       "zone_id": 542,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4362.090128710053,
       "high": 4366.309871289946,
       "pivot_price": 4364.2,
@@ -5410,7 +5410,7 @@
     },
     {
       "zone_id": 543,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4353.00422257628,
       "high": 4358.195777423721,
       "pivot_price": 4355.6,
@@ -5423,7 +5423,7 @@
     },
     {
       "zone_id": 545,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4358.505722876888,
       "high": 4361.894277123111,
       "pivot_price": 4360.2,
@@ -5436,7 +5436,7 @@
     },
     {
       "zone_id": 546,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4365.104578895272,
       "high": 4367.695421104727,
       "pivot_price": 4366.4,
@@ -5449,7 +5449,7 @@
     },
     {
       "zone_id": 547,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4368.9651225827065,
       "high": 4371.234877417294,
       "pivot_price": 4370.1,
@@ -5462,7 +5462,7 @@
     },
     {
       "zone_id": 548,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4359.169424387782,
       "high": 4362.030575612219,
       "pivot_price": 4360.6,
@@ -5475,7 +5475,7 @@
     },
     {
       "zone_id": 549,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4361.382688405354,
       "high": 4363.617311594646,
       "pivot_price": 4362.5,
@@ -5488,7 +5488,7 @@
     },
     {
       "zone_id": 550,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4369.606039721036,
       "high": 4371.593960278965,
       "pivot_price": 4370.6,
@@ -5501,7 +5501,7 @@
     },
     {
       "zone_id": 551,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4370.400013328376,
       "high": 4372.599986671624,
       "pivot_price": 4371.5,
@@ -5514,7 +5514,7 @@
     },
     {
       "zone_id": 552,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4371.501814863214,
       "high": 4373.098185136786,
       "pivot_price": 4372.3,
@@ -5527,7 +5527,7 @@
     },
     {
       "zone_id": 553,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4366.439589702866,
       "high": 4367.960410297133,
       "pivot_price": 4367.2,
@@ -5540,7 +5540,7 @@
     },
     {
       "zone_id": 554,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4366.072896973888,
       "high": 4367.527103026112,
       "pivot_price": 4366.8,
@@ -5553,7 +5553,7 @@
     },
     {
       "zone_id": 555,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4368.462979767703,
       "high": 4370.137020232298,
       "pivot_price": 4369.3,
@@ -5566,7 +5566,7 @@
     },
     {
       "zone_id": 556,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4364.177633170222,
       "high": 4365.822366829778,
       "pivot_price": 4365.0,
@@ -5579,7 +5579,7 @@
     },
     {
       "zone_id": 557,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4354.167631300402,
       "high": 4356.232368699598,
       "pivot_price": 4355.2,
@@ -5592,7 +5592,7 @@
     },
     {
       "zone_id": 558,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4360.058899864465,
       "high": 4362.141100135535,
       "pivot_price": 4361.1,
@@ -5605,7 +5605,7 @@
     },
     {
       "zone_id": 559,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4361.134985871909,
       "high": 4362.865014128091,
       "pivot_price": 4362.0,
@@ -5618,7 +5618,7 @@
     },
     {
       "zone_id": 560,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4361.28302067136,
       "high": 4362.916979328641,
       "pivot_price": 4362.1,
@@ -5631,7 +5631,7 @@
     },
     {
       "zone_id": 562,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4360.747008174429,
       "high": 4362.252991825571,
       "pivot_price": 4361.5,
@@ -5644,7 +5644,7 @@
     },
     {
       "zone_id": 563,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4358.366688796918,
       "high": 4359.633311203082,
       "pivot_price": 4359.0,
@@ -5657,7 +5657,7 @@
     },
     {
       "zone_id": 564,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4357.875095446341,
       "high": 4359.124904553659,
       "pivot_price": 4358.5,
@@ -5670,7 +5670,7 @@
     },
     {
       "zone_id": 565,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4362.318033440025,
       "high": 4363.681966559975,
       "pivot_price": 4363.0,
@@ -5683,7 +5683,7 @@
     },
     {
       "zone_id": 569,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4354.938979677725,
       "high": 4356.661020322275,
       "pivot_price": 4355.8,
@@ -5696,7 +5696,7 @@
     },
     {
       "zone_id": 570,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4355.642033731183,
       "high": 4357.357966268817,
       "pivot_price": 4356.5,
@@ -5709,7 +5709,7 @@
     },
     {
       "zone_id": 571,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4355.383130773261,
       "high": 4357.016869226739,
       "pivot_price": 4356.2,
@@ -5735,7 +5735,7 @@
     },
     {
       "zone_id": 573,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4354.223373031908,
       "high": 4355.976626968093,
       "pivot_price": 4355.1,
@@ -5787,7 +5787,7 @@
     },
     {
       "zone_id": 577,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4356.808198212051,
       "high": 4357.991801787948,
       "pivot_price": 4357.4,
@@ -5800,7 +5800,7 @@
     },
     {
       "zone_id": 579,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4353.071032647514,
       "high": 4354.328967352486,
       "pivot_price": 4353.7,
@@ -5852,7 +5852,7 @@
     },
     {
       "zone_id": 584,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4354.381962186889,
       "high": 4359.018037813111,
       "pivot_price": 4356.7,
@@ -5878,7 +5878,7 @@
     },
     {
       "zone_id": 587,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4348.755851221357,
       "high": 4355.044148778642,
       "pivot_price": 4351.9,
@@ -5891,7 +5891,7 @@
     },
     {
       "zone_id": 588,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4354.903962662737,
       "high": 4359.496037337262,
       "pivot_price": 4357.2,
@@ -5904,7 +5904,7 @@
     },
     {
       "zone_id": 589,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4362.068127340706,
       "high": 4365.1318726592945,
       "pivot_price": 4363.6,
@@ -5917,7 +5917,7 @@
     },
     {
       "zone_id": 590,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4356.143672898233,
       "high": 4359.056327101768,
       "pivot_price": 4357.6,
@@ -5930,7 +5930,7 @@
     },
     {
       "zone_id": 591,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4356.891065088268,
       "high": 4359.508934911732,
       "pivot_price": 4358.2,
@@ -5943,7 +5943,7 @@
     },
     {
       "zone_id": 593,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4353.4527380094305,
       "high": 4355.947261990569,
       "pivot_price": 4354.7,
@@ -5956,7 +5956,7 @@
     },
     {
       "zone_id": 597,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4359.088566648941,
       "high": 4360.311433351058,
       "pivot_price": 4359.7,
@@ -5969,7 +5969,7 @@
     },
     {
       "zone_id": 598,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4364.572057708619,
       "high": 4365.827942291381,
       "pivot_price": 4365.2,
@@ -5982,7 +5982,7 @@
     },
     {
       "zone_id": 599,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4363.972614943613,
       "high": 4365.227385056388,
       "pivot_price": 4364.6,
@@ -5995,7 +5995,7 @@
     },
     {
       "zone_id": 600,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4364.171028057373,
       "high": 4365.228971942626,
       "pivot_price": 4364.7,
@@ -6008,7 +6008,7 @@
     },
     {
       "zone_id": 601,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4358.6379849030645,
       "high": 4360.162015096935,
       "pivot_price": 4359.4,
@@ -6021,7 +6021,7 @@
     },
     {
       "zone_id": 602,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4356.300231852414,
       "high": 4357.699768147586,
       "pivot_price": 4357.0,
@@ -6190,7 +6190,7 @@
     },
     {
       "zone_id": 621,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4353.495494593339,
       "high": 4354.704505406662,
       "pivot_price": 4354.1,
@@ -6229,7 +6229,7 @@
     },
     {
       "zone_id": 629,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4357.375623817132,
       "high": 4360.024376182868,
       "pivot_price": 4358.7,
@@ -6242,7 +6242,7 @@
     },
     {
       "zone_id": 630,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4354.382279676132,
       "high": 4357.417720323867,
       "pivot_price": 4355.9,
@@ -6268,7 +6268,7 @@
     },
     {
       "zone_id": 633,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4365.86383850639,
       "high": 4369.736161493611,
       "pivot_price": 4367.8,
@@ -6281,7 +6281,7 @@
     },
     {
       "zone_id": 635,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4373.051215123361,
       "high": 4376.348784876639,
       "pivot_price": 4374.7,
@@ -6333,7 +6333,7 @@
     },
     {
       "zone_id": 640,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4374.318495867266,
       "high": 4376.281504132734,
       "pivot_price": 4375.3,
@@ -6346,7 +6346,7 @@
     },
     {
       "zone_id": 641,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4376.792795303272,
       "high": 4378.207204696728,
       "pivot_price": 4377.5,
@@ -6359,7 +6359,7 @@
     },
     {
       "zone_id": 642,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4372.710814183397,
       "high": 4374.289185816603,
       "pivot_price": 4373.5,
@@ -6372,7 +6372,7 @@
     },
     {
       "zone_id": 643,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4371.778865616921,
       "high": 4373.221134383079,
       "pivot_price": 4372.5,
@@ -6385,7 +6385,7 @@
     },
     {
       "zone_id": 646,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4367.379230146597,
       "high": 4368.820769853403,
       "pivot_price": 4368.1,
@@ -11013,7 +11013,7 @@
     },
     {
       "zone_id": 1217,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4355.013702706165,
       "high": 4357.186297293836,
       "pivot_price": 4356.1,
@@ -11026,7 +11026,7 @@
     },
     {
       "zone_id": 1219,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4373.088002021186,
       "high": 4375.711997978813,
       "pivot_price": 4374.4,
@@ -11039,7 +11039,7 @@
     },
     {
       "zone_id": 1220,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4375.715007079488,
       "high": 4377.884992920513,
       "pivot_price": 4376.8,
@@ -11052,7 +11052,7 @@
     },
     {
       "zone_id": 1221,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4369.655749191217,
       "high": 4371.944250808783,
       "pivot_price": 4370.8,
@@ -11130,7 +11130,7 @@
     },
     {
       "zone_id": 1227,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4350.40193659266,
       "high": 4357.59806340734,
       "pivot_price": 4354.0,
@@ -11299,7 +11299,7 @@
     },
     {
       "zone_id": 1249,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4358.0174442314965,
       "high": 4360.382555768503,
       "pivot_price": 4359.2,
@@ -11312,7 +11312,7 @@
     },
     {
       "zone_id": 1250,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4360.524303105007,
       "high": 4362.675696894994,
       "pivot_price": 4361.6,
@@ -11325,7 +11325,7 @@
     },
     {
       "zone_id": 1252,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4360.732250312123,
       "high": 4362.6677496878765,
       "pivot_price": 4361.7,
@@ -11338,7 +11338,7 @@
     },
     {
       "zone_id": 1253,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4361.930540883889,
       "high": 4363.469459116111,
       "pivot_price": 4362.7,
@@ -11351,7 +11351,7 @@
     },
     {
       "zone_id": 1254,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4362.53334100118,
       "high": 4363.86665899882,
       "pivot_price": 4363.2,
@@ -11364,7 +11364,7 @@
     },
     {
       "zone_id": 1255,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4360.206328279224,
       "high": 4361.593671720775,
       "pivot_price": 4360.9,
@@ -11403,7 +11403,7 @@
     },
     {
       "zone_id": 1259,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4373.95466794612,
       "high": 4376.04533205388,
       "pivot_price": 4375.0,
@@ -11416,7 +11416,7 @@
     },
     {
       "zone_id": 1260,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4376.893830012995,
       "high": 4378.7061699870055,
       "pivot_price": 4377.8,
@@ -11494,7 +11494,7 @@
     },
     {
       "zone_id": 1267,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4375.543746637454,
       "high": 4377.256253362545,
       "pivot_price": 4376.4,
@@ -11546,7 +11546,7 @@
     },
     {
       "zone_id": 1271,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4374.3347286121725,
       "high": 4377.065271387827,
       "pivot_price": 4375.7,
@@ -11559,7 +11559,7 @@
     },
     {
       "zone_id": 1272,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4374.551074447255,
       "high": 4377.248925552744,
       "pivot_price": 4375.9,
@@ -11585,7 +11585,7 @@
     },
     {
       "zone_id": 1274,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4365.366462827286,
       "high": 4369.433537172713,
       "pivot_price": 4367.4,
@@ -11598,7 +11598,7 @@
     },
     {
       "zone_id": 1275,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4357.1721323665615,
       "high": 4362.027867633439,
       "pivot_price": 4359.6,
@@ -11897,7 +11897,7 @@
     },
     {
       "zone_id": 1317,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4362.0210404337995,
       "high": 4365.9789595662005,
       "pivot_price": 4364.0,
@@ -11910,7 +11910,7 @@
     },
     {
       "zone_id": 1318,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4365.465405492394,
       "high": 4369.934594507606,
       "pivot_price": 4367.7,
@@ -12040,7 +12040,7 @@
     },
     {
       "zone_id": 1337,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4355.337508208553,
       "high": 4357.462491791446,
       "pivot_price": 4356.4,
@@ -12092,7 +12092,7 @@
     },
     {
       "zone_id": 1341,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4353.403688487483,
       "high": 4355.196311512517,
       "pivot_price": 4354.3,
@@ -12105,7 +12105,7 @@
     },
     {
       "zone_id": 1343,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4354.959931245628,
       "high": 4356.440068754372,
       "pivot_price": 4355.7,
@@ -12118,7 +12118,7 @@
     },
     {
       "zone_id": 1345,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4363.88343249027,
       "high": 4365.916567509729,
       "pivot_price": 4364.9,
@@ -12131,7 +12131,7 @@
     },
     {
       "zone_id": 1346,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4368.645320797128,
       "high": 4370.754679202872,
       "pivot_price": 4369.7,
@@ -12144,7 +12144,7 @@
     },
     {
       "zone_id": 1350,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4353.929600451553,
       "high": 4355.870399548447,
       "pivot_price": 4354.9,
@@ -12235,7 +12235,7 @@
     },
     {
       "zone_id": 1363,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4376.7691479256455,
       "high": 4379.630852074354,
       "pivot_price": 4378.2,
@@ -12248,7 +12248,7 @@
     },
     {
       "zone_id": 1364,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4367.908446654105,
       "high": 4372.091553345895,
       "pivot_price": 4370.0,
@@ -12261,7 +12261,7 @@
     },
     {
       "zone_id": 1365,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4374.909632924144,
       "high": 4379.290367075857,
       "pivot_price": 4377.1,
@@ -12274,7 +12274,7 @@
     },
     {
       "zone_id": 1367,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4360.980588832199,
       "high": 4365.8194111678,
       "pivot_price": 4363.4,
@@ -12287,7 +12287,7 @@
     },
     {
       "zone_id": 1369,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4371.6244900572965,
       "high": 4374.175509942703,
       "pivot_price": 4372.9,
@@ -12300,7 +12300,7 @@
     },
     {
       "zone_id": 1371,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4375.069210391795,
       "high": 4377.330789608204,
       "pivot_price": 4376.2,
@@ -12313,7 +12313,7 @@
     },
     {
       "zone_id": 1372,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4372.779405317556,
       "high": 4374.620594682444,
       "pivot_price": 4373.7,
@@ -12352,7 +12352,7 @@
     },
     {
       "zone_id": 1380,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4359.2617262124395,
       "high": 4361.338273787561,
       "pivot_price": 4360.3,
@@ -12365,7 +12365,7 @@
     },
     {
       "zone_id": 1381,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4367.148379882537,
       "high": 4369.251620117463,
       "pivot_price": 4368.2,
@@ -12378,7 +12378,7 @@
     },
     {
       "zone_id": 1383,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4367.109368301736,
       "high": 4368.690631698263,
       "pivot_price": 4367.9,
@@ -12391,7 +12391,7 @@
     },
     {
       "zone_id": 1386,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4366.896014046465,
       "high": 4368.103985953535,
       "pivot_price": 4367.5,
@@ -12404,7 +12404,7 @@
     },
     {
       "zone_id": 1388,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4365.185238412943,
       "high": 4366.814761587057,
       "pivot_price": 4366.0,
@@ -12417,7 +12417,7 @@
     },
     {
       "zone_id": 1390,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4365.033439102554,
       "high": 4366.166560897446,
       "pivot_price": 4365.6,
@@ -12430,7 +12430,7 @@
     },
     {
       "zone_id": 1392,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4360.153762567025,
       "high": 4361.846237432975,
       "pivot_price": 4361.0,
@@ -12443,7 +12443,7 @@
     },
     {
       "zone_id": 1394,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4358.261422410633,
       "high": 4359.938577589368,
       "pivot_price": 4359.1,
@@ -12456,7 +12456,7 @@
     },
     {
       "zone_id": 1395,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4357.095735073068,
       "high": 4358.7042649269315,
       "pivot_price": 4357.9,
@@ -12469,7 +12469,7 @@
     },
     {
       "zone_id": 1397,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4356.1959854276965,
       "high": 4357.604014572303,
       "pivot_price": 4356.9,
@@ -12482,7 +12482,7 @@
     },
     {
       "zone_id": 1398,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4358.523483136832,
       "high": 4360.076516863169,
       "pivot_price": 4359.3,
@@ -12495,7 +12495,7 @@
     },
     {
       "zone_id": 1399,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4360.136920955263,
       "high": 4361.463079044737,
       "pivot_price": 4360.8,
@@ -12508,7 +12508,7 @@
     },
     {
       "zone_id": 1402,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4354.687806426428,
       "high": 4356.312193573572,
       "pivot_price": 4355.5,
@@ -12521,7 +12521,7 @@
     },
     {
       "zone_id": 1405,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4372.054878705023,
       "high": 4375.545121294977,
       "pivot_price": 4373.8,
@@ -12534,7 +12534,7 @@
     },
     {
       "zone_id": 1407,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4366.325514447267,
       "high": 4371.2744855527335,
       "pivot_price": 4368.8,
@@ -12573,7 +12573,7 @@
     },
     {
       "zone_id": 1413,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4372.306225504122,
       "high": 4375.693774495878,
       "pivot_price": 4374.0,
@@ -12586,7 +12586,7 @@
     },
     {
       "zone_id": 1424,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4356.168234106892,
       "high": 4358.431765893109,
       "pivot_price": 4357.3,
@@ -12638,7 +12638,7 @@
     },
     {
       "zone_id": 1434,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4357.22004886328,
       "high": 4358.77995113672,
       "pivot_price": 4358.0,
@@ -12651,7 +12651,7 @@
     },
     {
       "zone_id": 1440,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4356.208084517758,
       "high": 4357.391915482242,
       "pivot_price": 4356.8,
@@ -12664,7 +12664,7 @@
     },
     {
       "zone_id": 1441,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4361.630845029194,
       "high": 4363.169154970806,
       "pivot_price": 4362.4,
@@ -12677,7 +12677,7 @@
     },
     {
       "zone_id": 1446,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4358.8803273656295,
       "high": 4360.1196726343705,
       "pivot_price": 4359.5,
@@ -12690,7 +12690,7 @@
     },
     {
       "zone_id": 1448,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4357.315271023404,
       "high": 4358.884728976596,
       "pivot_price": 4358.1,
@@ -12703,7 +12703,7 @@
     },
     {
       "zone_id": 1451,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4368.161900856715,
       "high": 4371.438099143285,
       "pivot_price": 4369.8,
@@ -12807,7 +12807,7 @@
     },
     {
       "zone_id": 1462,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4376.454570174487,
       "high": 4377.945429825512,
       "pivot_price": 4377.2,
@@ -12820,7 +12820,7 @@
     },
     {
       "zone_id": 1463,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4370.713257942553,
       "high": 4371.886742057447,
       "pivot_price": 4371.3,
@@ -15049,10 +15049,10 @@
       "pivot_price": 4345.7,
       "created_index": 96,
       "created_time": "2025-12-29T15:06:00",
-      "confidence": 1.0,
-      "touch_count": 0,
-      "is_active": true,
-      "last_touch_index": null
+      "confidence": 0.39999999999999997,
+      "touch_count": 2,
+      "is_active": false,
+      "last_touch_index": 99
     },
     {
       "zone_id": 9,
@@ -15069,7 +15069,7 @@
     },
     {
       "zone_id": 14,
-      "zone_type": "supply",
+      "zone_type": "demand",
       "low": 4357.799206245907,
       "high": 4363.200793754093,
       "pivot_price": 4360.5,
@@ -15166,24 +15166,271 @@
       "pivot_price": 4348.6,
       "created_index": 96,
       "created_time": "2025-12-29T19:51:00",
+      "confidence": 0.39999999999999997,
+      "touch_count": 2,
+      "is_active": false,
+      "last_touch_index": 99
+    },
+    {
+      "zone_id": 23,
+      "zone_type": "demand",
+      "low": 4358.938841434677,
+      "high": 4361.261158565324,
+      "pivot_price": 4360.1,
+      "created_index": 96,
+      "created_time": "2025-12-29T20:30:00",
+      "confidence": 0.39999999999999997,
+      "touch_count": 2,
+      "is_active": false,
+      "last_touch_index": 490
+    },
+    {
+      "zone_id": 12,
+      "zone_type": "demand",
+      "low": 4345.490181105427,
+      "high": 4348.709818894574,
+      "pivot_price": 4347.1,
+      "created_index": 96,
+      "created_time": "2025-12-29T21:00:00",
       "confidence": 1.0,
       "touch_count": 0,
       "is_active": true,
       "last_touch_index": null
     },
     {
-      "zone_id": 23,
+      "zone_id": 53,
+      "zone_type": "demand",
+      "low": 4336.791817445346,
+      "high": 4340.208182554654,
+      "pivot_price": 4338.5,
+      "created_index": 466,
+      "created_time": "2025-12-29T23:18:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 54,
+      "zone_type": "demand",
+      "low": 4345.663938776143,
+      "high": 4348.136061223856,
+      "pivot_price": 4346.9,
+      "created_index": 473,
+      "created_time": "2025-12-29T23:39:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 55,
+      "zone_type": "demand",
+      "low": 4352.244737893012,
+      "high": 4354.755262106988,
+      "pivot_price": 4353.5,
+      "created_index": 481,
+      "created_time": "2025-12-30T00:03:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 99,
+      "zone_type": "demand",
+      "low": 4364.109052819009,
+      "high": 4366.4909471809915,
+      "pivot_price": 4365.3,
+      "created_index": 485,
+      "created_time": "2025-12-30T00:15:00",
+      "confidence": 0.7,
+      "touch_count": 1,
+      "is_active": true,
+      "last_touch_index": 499
+    },
+    {
+      "zone_id": 57,
+      "zone_type": "demand",
+      "low": 4337.207939525812,
+      "high": 4340.792060474188,
+      "pivot_price": 4339.0,
+      "created_index": 487,
+      "created_time": "2025-12-30T01:03:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 102,
+      "zone_type": "demand",
+      "low": 4356.438888968371,
+      "high": 4360.361111031628,
+      "pivot_price": 4358.4,
+      "created_index": 492,
+      "created_time": "2025-12-30T01:18:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 58,
+      "zone_type": "demand",
+      "low": 4344.547004994088,
+      "high": 4348.052995005913,
+      "pivot_price": 4346.3,
+      "created_index": 496,
+      "created_time": "2025-12-30T01:30:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 56,
+      "zone_type": "demand",
+      "low": 4363.858640347582,
+      "high": 4366.941359652417,
+      "pivot_price": 4365.4,
+      "created_index": 492,
+      "created_time": "2025-12-30T02:12:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 102,
+      "zone_type": "demand",
+      "low": 4370.131867638851,
+      "high": 4373.06813236115,
+      "pivot_price": 4371.6,
+      "created_index": 494,
+      "created_time": "2025-12-30T02:18:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 868,
+      "zone_type": "demand",
+      "low": 4369.281447282728,
+      "high": 4371.718552717272,
+      "pivot_price": 4370.5,
+      "created_index": 9218,
+      "created_time": "2025-12-30T03:09:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 1714,
       "zone_type": "supply",
-      "low": 4358.938841434677,
-      "high": 4361.261158565324,
-      "pivot_price": 4360.1,
-      "created_index": 96,
-      "created_time": "2025-12-29T20:30:00",
+      "low": 4377.817548157478,
+      "high": 4380.182451842522,
+      "pivot_price": 4379.0,
+      "created_index": 9216,
+      "created_time": "2025-12-30T03:03:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 1715,
+      "zone_type": "supply",
+      "low": 4381.97140206983,
+      "high": 4384.02859793017,
+      "pivot_price": 4383.0,
+      "created_index": 9225,
+      "created_time": "2025-12-30T03:30:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 54,
+      "zone_type": "demand",
+      "low": 4369.802206851983,
+      "high": 4371.5977931480165,
+      "pivot_price": 4370.7,
+      "created_index": 496,
+      "created_time": "2025-12-30T03:57:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 100,
+      "zone_type": "demand",
+      "low": 4376.073912605052,
+      "high": 4377.926087394948,
+      "pivot_price": 4377.0,
+      "created_index": 496,
+      "created_time": "2025-12-30T04:00:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 870,
+      "zone_type": "demand",
+      "low": 4372.485955473454,
+      "high": 4374.114044526546,
+      "pivot_price": 4373.3,
+      "created_index": 9257,
+      "created_time": "2025-12-30T05:06:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 1720,
+      "zone_type": "supply",
+      "low": 4378.656331251639,
+      "high": 4380.14366874836,
+      "pivot_price": 4379.4,
+      "created_index": 9255,
+      "created_time": "2025-12-30T05:00:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 51,
+      "zone_type": "supply",
+      "low": 4385.415367678012,
+      "high": 4387.784632321988,
+      "pivot_price": 4386.6,
+      "created_index": 496,
+      "created_time": "2025-12-30T05:45:00",
+      "confidence": 1.0,
+      "touch_count": 0,
+      "is_active": true,
+      "last_touch_index": null
+    },
+    {
+      "zone_id": 96,
+      "zone_type": "supply",
+      "low": 4392.742742833706,
+      "high": 4395.057257166293,
+      "pivot_price": 4393.9,
+      "created_index": 496,
+      "created_time": "2025-12-30T05:51:00",
       "confidence": 1.0,
       "touch_count": 0,
       "is_active": true,
       "last_touch_index": null
     }
   ],
-  "zone_counter": 1641
+  "zone_counter": 1721
 }

@@ -2,6 +2,8 @@ import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
 from enum import Enum
+import csv
+from pathlib import Path
 
 
 class PositionStatus(Enum):
@@ -123,7 +125,7 @@ class RiskManager:
         self.cooldown_bars = cooldown_config.get('pause_bars', 20)
         
         self.max_trades_per_day = config.get('max_trades_per_day', 6)
-        self.daily_loss_limit = config.get('daily_loss_limit', -800)
+        self.daily_loss_limit = config.get('daily_loss_limit', -2500)
         
         self.trade_counter = 0
         self.order_counter = 0
@@ -382,14 +384,23 @@ class RiskManager:
         confirmation_type: str,
         risk_ticks: float,
         reward_ticks: float,
-        structure_levels: List[float] = None
+        structure_levels: List[float] = None,
+        indicator_values: Dict[str, float] = None,
+        filter_results: Dict[str, bool] = None
     ) -> Position:
         self.trade_counter += 1
+        
+        # Apply slippage to entry price (backtest fill model)
+        slippage = self.slippage_ticks * self.tick_size
+        if side == 'long':
+            actual_entry_price = entry_price + slippage  # Pay ask price
+        else:
+            actual_entry_price = entry_price - slippage  # Pay bid price
         
         position = Position(
             trade_id=self.trade_counter,
             side=side,
-            entry_price=entry_price,
+            entry_price=actual_entry_price,  # Use actual fill price with slippage
             entry_time=entry_time,
             entry_index=entry_index,
             initial_stop_loss=stop_loss,
@@ -405,12 +416,118 @@ class RiskManager:
             structure_levels=structure_levels or []
         )
         
+        # Log decision to structured CSV for model improvement
+        self._log_decision(
+            signal_price=entry_price,
+            fill_price=actual_entry_price,
+            side=side,
+            timestamp=entry_time,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            risk_ticks=risk_ticks,
+            reward_ticks=reward_ticks,
+            session=session,
+            zone_confidence=zone_confidence,
+            confirmation_type=confirmation_type,
+            indicator_values=indicator_values,
+            filter_results=filter_results
+        )
+        
         self.current_position = position
         
         date = entry_time.date()
         self.daily_trades[date] = self.daily_trades.get(date, 0) + 1
         
         return position
+    
+    def _log_decision(
+        self,
+        signal_price: float,
+        fill_price: float,
+        side: str,
+        timestamp: pd.Timestamp,
+        stop_loss: float,
+        take_profit: float,
+        risk_ticks: float,
+        reward_ticks: float,
+        session: str,
+        zone_confidence: float,
+        confirmation_type: str,
+        indicator_values: Dict[str, float] = None,
+        filter_results: Dict[str, bool] = None
+    ) -> None:
+        """Log trade decision to structured CSV for analysis and model improvement"""
+        decision_file = Path('trades_decisions.csv')
+        file_exists = decision_file.exists()
+        
+        decision_data = {
+            'timestamp': timestamp,
+            'trade_id': self.trade_counter,
+            'side': side,
+            'signal_price': signal_price,
+            'fill_price': fill_price,
+            'slippage_ticks': self.slippage_ticks,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'risk_ticks': risk_ticks,
+            'reward_ticks': reward_ticks,
+            'rr_ratio': reward_ticks / risk_ticks if risk_ticks > 0 else 0,
+            'session': session,
+            'zone_confidence': zone_confidence,
+            'confirmation_type': confirmation_type,
+            'vwap': indicator_values.get('vwap', 0) if indicator_values else 0,
+            'atr': indicator_values.get('atr', 0) if indicator_values else 0,
+            'ema': indicator_values.get('ema', 0) if indicator_values else 0,
+            'filter_vwap': filter_results.get('vwap_filter', True) if filter_results else True,
+            'filter_chop': filter_results.get('chop_filter', True) if filter_results else True,
+            'filter_volume': filter_results.get('volume_filter', True) if filter_results else True,
+            'filter_htf_long': filter_results.get('htf_filter_long', True) if filter_results else True,
+            'filter_htf_short': filter_results.get('htf_filter_short', True) if filter_results else True,
+            'entry_time': timestamp,
+            'exit_time': None,
+            'exit_price': None,
+            'pnl': None,
+            'exit_reason': None
+        }
+        
+        with open(decision_file, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=decision_data.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(decision_data)
+    
+    def _update_decision_log(
+        self,
+        trade_id: int,
+        exit_time: pd.Timestamp,
+        exit_price: float,
+        pnl: float,
+        exit_reason: str
+    ) -> None:
+        """Update decision log with trade outcome"""
+        decision_file = Path('trades_decisions.csv')
+        if not decision_file.exists():
+            return
+        
+        # Check if file is empty
+        if decision_file.stat().st_size == 0:
+            return
+        
+        # Read, update, write back
+        try:
+            df = pd.read_csv(decision_file)
+            if df.empty:
+                return
+        except (pd.errors.EmptyDataError, pd.errors.ParserError):
+            return
+        mask = df['trade_id'] == trade_id
+        if mask.any():
+            # Convert to proper types to avoid dtype warnings
+            df.loc[mask, 'exit_time'] = pd.to_datetime(exit_time) if exit_time else None
+            df.loc[mask, 'exit_price'] = float(exit_price) if exit_price is not None else None
+            df.loc[mask, 'pnl'] = float(pnl) if pnl is not None else None
+            df.loc[mask, 'exit_reason'] = str(exit_reason) if exit_reason else None
+            df.to_csv(decision_file, index=False)
     
     def update_position(
         self,
@@ -743,6 +860,15 @@ class RiskManager:
             break_even_triggered=pos.break_even_triggered,
             exit_reason=exit_reason,
             cooldown_active=self.is_in_cooldown()
+        )
+        
+        # Update decision log with exit information
+        self._update_decision_log(
+            trade_id=pos.trade_id,
+            exit_time=timestamp,
+            exit_price=actual_exit,
+            pnl=net_pnl,
+            exit_reason=exit_reason
         )
         
         self.trade_results.append(result)
