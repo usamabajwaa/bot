@@ -47,6 +47,11 @@ class SessionManager:
         self.tz = pytz.timezone(config.get('timezone', 'America/Chicago'))
         self.sessions = config.get('sessions', {})
         self.buffer_minutes = config.get('session_boundary_buffer_minutes', 5)
+        # Session times are defined in UTC (explicitly documented)
+        self.session_timezone = config.get('session_timezone', 'UTC')
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Session times are defined in UTC (config: {self.session_timezone})")
     
     def parse_time(self, time_str: str) -> time:
         parts = time_str.split(':')
@@ -55,6 +60,8 @@ class SessionManager:
     def get_active_session(self, timestamp: pd.Timestamp) -> Optional[str]:
         # Session times are in UTC, so convert timestamp to UTC
         import pytz
+        import logging
+        logger = logging.getLogger(__name__)
         utc = pytz.UTC
         if timestamp.tzinfo is None:
             # Assume UTC if no timezone info
@@ -62,6 +69,7 @@ class SessionManager:
         else:
             timestamp = timestamp.astimezone(utc)
         
+        logger.debug(f"Checking session for {timestamp} UTC")
         current_time = timestamp.time()
         
         # Check sessions in priority order (us, asia, london) to handle overlaps correctly
@@ -165,6 +173,7 @@ class Strategy:
         
         vwap_obstruction_config = config.get('vwap_obstruction', {})
         self.vwap_obstruction_enabled = vwap_obstruction_config.get('enabled', False)
+        self.vwap_buffer_ticks = vwap_obstruction_config.get('buffer_ticks', 2)  # Default to 2 if not configured
         
         # NEW: Order Flow Analysis settings
         order_flow_config = config.get('order_flow', {})
@@ -188,6 +197,8 @@ class Strategy:
         self.require_consolidation = entry_timing_config.get('require_consolidation', False)
         self.consolidation_bars = entry_timing_config.get('consolidation_bars', 3)
         self.min_bars_in_zone = entry_timing_config.get('min_bars_in_zone', 2)
+        self.require_liquidity_sweep = entry_timing_config.get('require_liquidity_sweep', True)
+        self.sweep_lookback_bars = entry_timing_config.get('sweep_lookback_bars', 3)
         
         # NEW: Dynamic Position Sizing settings
         sizing_config = config.get('dynamic_sizing', {})
@@ -245,16 +256,12 @@ class Strategy:
             df: DataFrame with market data
             merge_zones: If True, merge new zones with existing ones instead of replacing
         """
-        import sys
-        print(f"Preparing data: {len(df)} bars...", file=sys.stderr)
+        # Removed stderr print statements to avoid Windows background process errors
         df = df.copy()
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df = df.sort_values('timestamp').reset_index(drop=True)
         
-        print("  Calculating indicators...", file=sys.stderr)
         df = self.indicators.add_indicators_to_df(df)
-        
-        print("  Detecting pivots...", file=sys.stderr)
         pivot_highs, pivot_lows = self.indicators.detect_all_pivots(df, self.pivot_strength)
         
         # Use global config for zone building instead of always using 'us' session
@@ -505,6 +512,38 @@ class Strategy:
         
         return passed, ','.join(reasons) if reasons else 'ok'
     
+    def detect_liquidity_sweep(
+        self,
+        df: pd.DataFrame,
+        zone: Zone,
+        bar_index: int,
+        side: str
+    ) -> bool:
+        """
+        Detect if price swept liquidity below/above zone before reversing.
+        This improves entry timing and confirms zone strength.
+        
+        For LONG: Check if price wicked below zone low then closed back inside
+        For SHORT: Check if price wicked above zone high then closed back inside
+        """
+        if bar_index < self.sweep_lookback_bars:
+            return False
+        
+        # Look at recent bars (lookback_bars + 1 to include current bar)
+        start_idx = max(0, bar_index - self.sweep_lookback_bars)
+        recent_bars = df.iloc[start_idx:bar_index+1]
+        
+        if side == 'long':
+            # Check if price wicked below zone low then closed back inside
+            swept = any(bar['low'] < zone.low for _, bar in recent_bars.iterrows())
+            recovered = df.iloc[bar_index]['close'] > zone.low
+            return swept and recovered
+        else:  # short
+            # Check if price wicked above zone high then closed back inside
+            swept = any(bar['high'] > zone.high for _, bar in recent_bars.iterrows())
+            recovered = df.iloc[bar_index]['close'] < zone.high
+            return swept and recovered
+    
     # ========================================
     # NEW: Dynamic Position Sizing
     # ========================================
@@ -726,15 +765,13 @@ class Strategy:
                             break
                     else:
                         # No structure level before VWAP - cap TP to VWAP minus buffer
-                        vwap_buffer_ticks = 2  # Small buffer to avoid VWAP
-                        take_profit = vwap - (vwap_buffer_ticks * self.tick_size)
+                        take_profit = vwap - (self.vwap_buffer_ticks * self.tick_size)
                         # Ensure TP still meets min R:R
                         if take_profit < min_tp:
                             return None, None, None, None
                 else:
                     # No structure levels - cap TP to VWAP minus buffer
-                    vwap_buffer_ticks = 2
-                    take_profit = vwap - (vwap_buffer_ticks * self.tick_size)
+                    take_profit = vwap - (self.vwap_buffer_ticks * self.tick_size)
                     if take_profit < min_tp:
                         return None, None, None, None
             
@@ -771,15 +808,13 @@ class Strategy:
                             break
                     else:
                         # No structure level below VWAP - cap TP to VWAP minus buffer
-                        vwap_buffer_ticks = 2  # Small buffer to avoid VWAP
-                        take_profit = vwap - (vwap_buffer_ticks * self.tick_size)
+                        take_profit = vwap - (self.vwap_buffer_ticks * self.tick_size)
                         # Ensure TP still meets min R:R (for shorts, TP must be <= min_tp)
                         if take_profit > min_tp:
                             return None, None, None, None
                 else:
                     # No structure levels - cap TP to VWAP minus buffer
-                    vwap_buffer_ticks = 2
-                    take_profit = vwap - (vwap_buffer_ticks * self.tick_size)
+                    take_profit = vwap - (self.vwap_buffer_ticks * self.tick_size)
                     if take_profit > min_tp:
                         return None, None, None, None
             
@@ -1035,6 +1070,17 @@ class Strategy:
                     print(f"    -> Entry timing filter failed: {timing_reason}")
                 continue
             filter_results['entry_timing'] = timing_reason
+            
+            # NEW: Check liquidity sweep detection (required filter)
+            if self.require_liquidity_sweep:
+                sweep_detected = self.detect_liquidity_sweep(df, zone, bar_index, side)
+                filter_results['liquidity_sweep'] = sweep_detected
+                if not sweep_detected:
+                    if debug_log:
+                        print(f"    -> Liquidity sweep filter failed: no sweep detected")
+                    continue
+            else:
+                filter_results['liquidity_sweep'] = True  # Not required, pass
             
             confirmed, confirm_type = self.check_confirmation(
                 bar, prev_bar, zone, side

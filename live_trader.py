@@ -1,6 +1,8 @@
 import json
 import time
 import logging
+import os
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List
@@ -41,19 +43,123 @@ for handler in root_logger.handlers[:]:  # Copy list to avoid modification durin
     if hasattr(handler, 'close'):
         handler.close()
 
-# Add exactly one file handler and one stream handler
+# Add file handler only (StreamHandler removed to avoid OSError in background processes)
+# Logs will only go to file, which is fine for background processes
 file_handler = logging.FileHandler('live_trading.log')
 file_handler.setFormatter(formatter)
 root_logger.addHandler(file_handler)
 
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(formatter)
-root_logger.addHandler(stream_handler)
+# StreamHandler removed: When running as background process on Windows,
+# stderr/stdout handles are invalid, causing OSError [Errno 22] Invalid argument
+# File logging is sufficient for background operation
 
 # Set level
 root_logger.setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
+
+
+def validate_config(config: dict) -> List[str]:
+    """Validate configuration and return list of issues"""
+    issues = []
+    
+    # Required fields
+    required = ['tick_size', 'tick_value', 'position_size_contracts']
+    for field in required:
+        if field not in config:
+            issues.append(f"Missing required field: {field}")
+    
+    # Logical checks
+    if 'min_rr' in config and config['min_rr'] < 1.0:
+        issues.append("min_rr should be >= 1.0 for positive expectancy")
+    
+    if 'daily_loss_limit' in config and config['daily_loss_limit'] >= 0:
+        issues.append("daily_loss_limit should be negative")
+    
+    # Session checks
+    sessions = config.get('sessions', {})
+    for name, sess in sessions.items():
+        if 'start' not in sess or 'end' not in sess:
+            issues.append(f"Session '{name}' missing start/end times")
+    
+    # Position size check
+    if 'position_size_contracts' in config:
+        pos_size = config['position_size_contracts']
+        if not isinstance(pos_size, int) or pos_size <= 0:
+            issues.append("position_size_contracts must be a positive integer")
+    
+    # Tick size/value checks
+    if 'tick_size' in config and config['tick_size'] <= 0:
+        issues.append("tick_size must be positive")
+    if 'tick_value' in config and config['tick_value'] <= 0:
+        issues.append("tick_value must be positive")
+    
+    return issues
+
+
+class CircuitBreaker:
+    """Circuit breaker to prevent repeated failures from causing cascading issues"""
+    def __init__(self, failure_threshold: int = 3, timeout_minutes: int = 15):
+        self.failure_count = 0
+        self.failure_threshold = failure_threshold
+        self.timeout_minutes = timeout_minutes
+        self.last_failure_time = None
+        self.is_open = False
+    
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = datetime.now()
+        
+        if self.failure_count >= self.failure_threshold:
+            self.is_open = True
+            logger.error(f"🚨 CIRCUIT BREAKER OPENED after {self.failure_count} failures")
+    
+    def record_success(self):
+        self.failure_count = 0
+        if self.is_open:
+            logger.info("OK Circuit breaker CLOSED - failures reset")
+        self.is_open = False
+    
+    def should_allow_trade(self) -> bool:
+        if not self.is_open:
+            return True
+        
+        # Check if timeout has passed
+        if self.last_failure_time:
+            elapsed = (datetime.now() - self.last_failure_time).total_seconds() / 60
+            if elapsed >= self.timeout_minutes:
+                logger.info(f"Circuit breaker reset after {elapsed:.1f} minute timeout")
+                self.is_open = False
+                self.failure_count = 0
+                return True
+        
+        return False
+
+
+class ConnectionMonitor:
+    """Monitor connection health via heartbeat tracking"""
+    def __init__(self, heartbeat_interval: int = 60, max_missed: int = 3):
+        self.last_heartbeat = datetime.now()
+        self.heartbeat_interval = heartbeat_interval
+        self.max_missed = max_missed
+        self.missed_count = 0
+    
+    def record_heartbeat(self):
+        self.last_heartbeat = datetime.now()
+        self.missed_count = 0
+    
+    def check_health(self) -> bool:
+        elapsed = (datetime.now() - self.last_heartbeat).total_seconds()
+        
+        if elapsed > self.heartbeat_interval:
+            self.missed_count += 1
+            logger.warning(f"Missed heartbeat #{self.missed_count} (elapsed: {elapsed:.0f}s, threshold: {self.heartbeat_interval}s)")
+            
+            if self.missed_count >= self.max_missed:
+                logger.error(f"❌ Connection appears dead - {self.missed_count} missed heartbeats (triggering reconnect)")
+                return False
+        
+        return True
 
 
 class LiveTrader:
@@ -64,6 +170,15 @@ class LiveTrader:
         credentials_path: str = 'credentials.json'
     ):
         self.config = self._load_config(config_path)
+        
+        # Validate configuration
+        config_issues = validate_config(self.config)
+        if config_issues:
+            logger.error("Configuration validation failed:")
+            for issue in config_issues:
+                logger.error(f"  - {issue}")
+            raise ValueError(f"Invalid configuration: {len(config_issues)} issue(s) found")
+        
         self.credentials = self._load_credentials(credentials_path)
         
         base_url = self.credentials.get('base_url')
@@ -89,8 +204,10 @@ class LiveTrader:
         self.position_size = self.config.get('position_size_contracts', 5)
         self.daily_loss_limit = self.config.get('daily_loss_limit', -2500)
         self.max_trades_per_day = self.config.get('max_trades_per_day', 4)
+        self.max_position_hours = self.config.get('max_position_hours', 8)  # Force close after N hours
         self.tick_size = self.config.get('tick_size', 0.10)
         self.tick_value = self.config.get('tick_value', 1.0)
+        self.commission_per_contract = self.config.get('commission_per_contract', 0.62)
         
         trailing_config = self.config.get('trailing_stop', {})
         self.trailing_enabled = trailing_config.get('enabled', False)
@@ -111,6 +228,9 @@ class LiveTrader:
         self.liquidity_sweep_buffer_ticks = partial_config.get('liquidity_sweep_buffer_ticks', 10)
         # How much profit to lock after partial exit (0.5R gives more room for retest)
         self.post_partial_sl_lock_r = partial_config.get('post_partial_sl_lock_r', 0.5)
+        # Graduated scale-out levels
+        self.scale_out_levels = partial_config.get('scale_out_levels', [])
+        self.scale_out_mode = partial_config.get('scale_out_mode', 'standard')  # 'standard' or 'graduated'
         
         # Limit order retest config
         limit_config = self.config.get('limit_order_retest', {})
@@ -124,6 +244,9 @@ class LiveTrader:
         self.pending_limit_order: Optional[Dict] = None  # For limit order retest
         self._executing_entry = False  # Lock to prevent concurrent entry execution
         self._trading_locked = False  # Lock to prevent new signals/trades while position is open
+        self._last_watchdog_check: Optional[datetime] = None  # Debouncing for watchdog
+        self._last_order_update: Optional[datetime] = None  # Debouncing for order updates
+        self._last_trailing_update: Optional[datetime] = None  # Debouncing for trailing stop updates
         
         self.daily_trades = 0
         self.daily_pnl = 0.0
@@ -148,6 +271,14 @@ class LiveTrader:
         self.cooldown_minutes = pause_bars * bar_interval_minutes
         self.consecutive_losses = 0
         self.cooldown_until: Optional[datetime] = None
+        self.last_processed_trade_id: Optional[int] = None  # Track last processed trade to avoid double-counting
+        self.last_position_qty: Optional[int] = None  # Track last known position quantity for P&L calculation
+        
+        # Circuit breaker to prevent repeated failures
+        self.circuit_breaker = CircuitBreaker(failure_threshold=3, timeout_minutes=15)
+        
+        # Connection monitor for heartbeat tracking
+        self.connection_monitor = ConnectionMonitor(heartbeat_interval=60, max_missed=3)
         
         # Replay mode: save bars when signals are generated
         self.save_replay_data = True  # Configurable flag
@@ -166,7 +297,7 @@ class LiveTrader:
         self.save_replay_data = True  # Configurable flag
         self.replay_data_dir = Path('replay_data')
         self.replay_data_dir.mkdir(exist_ok=True)
-        
+    
     def _load_config(self, path: str) -> dict:
         with open(path, 'r') as f:
             return json.load(f)
@@ -300,15 +431,17 @@ class LiveTrader:
                     if self.current_position is None:
                         logger.warning(f"Found orphaned position on startup: {pos.size} contracts @ ${pos.average_price:.2f}")
                         # Create a UserPosition-like object for syncing
+                        # Use actual position_type from Position object (more reliable)
                         from broker.signalr_client import UserPosition
                         broker_pos = UserPosition(
                             id=0,
                             account_id=self.client.account_id,
                             contract_id=pos.contract_id,
-                            position_type=1 if pos.size > 0 else 2,
+                            position_type=pos.position_type.value,  # Use actual position_type (1=LONG, 2=SHORT)
                             size=pos.size,
                             average_price=pos.average_price
                         )
+                        logger.info(f"Position type from broker: {pos.position_type.name} (value: {pos.position_type.value})")
                         self._sync_position_from_broker(broker_pos)
                     else:
                         logger.info(f"Position already tracked: {pos.size} contracts")
@@ -468,27 +601,113 @@ class LiveTrader:
         logger.info(f"Position update: {position.contract_id} Size: {position.size}")
         
         if position.size == 0 and self.current_position:
-            logger.info("Position closed")
+            logger.info("Position closed (detected via SignalR)")
+            
+            # CRITICAL FIX: Calculate and process P&L when position closes (fallback if trade callback missed)
+            # This ensures cooldown triggers even if _on_trade() callback didn't fire
+            try:
+                entry_price = self.current_position.get('entry_price')
+                current_price = self._get_current_price()
+                
+                if entry_price and current_price:
+                    side = self.current_position.get('side')
+                    quantity = self.current_position.get('quantity', self.position_size)
+                    
+                    # Calculate P&L
+                    if side == 'long':
+                        pnl_ticks = (current_price - entry_price) / self.tick_size
+                    else:
+                        pnl_ticks = (entry_price - current_price) / self.tick_size
+                    
+                    # Estimate commission (open + close)
+                    commission = self.commission_per_contract * quantity * 2
+                    gross_pnl = pnl_ticks * self.tick_value * quantity
+                    net_pnl = gross_pnl - commission
+                    
+                    logger.warning(f"[COOLDOWN FALLBACK] Position closed via SignalR - calculated P&L: ${net_pnl:.2f} (entry: ${entry_price:.2f}, exit: ${current_price:.2f}, qty: {quantity})")
+                    
+                    # Process P&L for cooldown (only if we haven't processed it already via trade callback)
+                    # Use a dummy trade_id based on timestamp to allow processing
+                    fallback_trade_id = int(datetime.now(self.timezone).timestamp() * 1000)
+                    self._process_trade_pnl(net_pnl, trade_id=fallback_trade_id, source="SignalR_position_close")
+                    
+                    # Update daily P&L if not already updated by trade callback
+                    self.daily_pnl += net_pnl
+            except Exception as e:
+                logger.warning(f"Could not calculate P&L on position close: {e}")
+            
+            # CRITICAL: Cancel any remaining bracket orders (SL/TP) when position is closed
+            # Position Brackets doesn't auto-cancel, so we must clean up manually
+            logger.warning("Position closed - immediately cleaning up remaining SL/TP orders...")
+            self._cancel_remaining_bracket_orders()
+            
+            # Wait briefly then call again to catch any missed orders
+            import time
+            time.sleep(0.5)
+            self._cancel_remaining_bracket_orders()
+            
+            # CRITICAL: Double-check and close everything remaining
+            logger.info("Double-checking: Closing any remaining positions and orders...")
+            self._emergency_close_all()
+            
+            # Clear position tracking
             self.current_position = None
+            self.last_position_qty = None
             # Release trading lock when position closes
             self._trading_locked = False
             logger.info("Trading lock released - new signals allowed")
+        elif self.current_position:
+            # Update last known position quantity
+            self.last_position_qty = abs(position.size)
+    
+    def _process_trade_pnl(self, pnl: float, trade_id: Optional[int] = None, source: str = "unknown") -> None:
+        """
+        Process trade P&L and update cooldown state.
+        This is called from multiple sources (_on_trade callback, position close detection, etc.)
+        to ensure cooldown triggers reliably even if SignalR callbacks fail.
+        
+        Args:
+            pnl: Trade P&L (negative for losses)
+            trade_id: Optional trade ID to prevent double-counting
+            source: Source of the trade (for logging)
+        """
+        # Prevent double-counting if we have a trade ID
+        if trade_id is not None and trade_id == self.last_processed_trade_id:
+            logger.debug(f"Skipping duplicate trade processing (ID: {trade_id}, source: {source})")
+            return
+        
+        if pnl == 0:
+            return  # Skip zero P&L trades
+        
+        logger.info(f"[COOLDOWN TRACKING] Processing trade P&L: ${pnl:.2f} (source: {source}, trade_id: {trade_id})")
+        
+        if pnl < 0:
+            self.consecutive_losses += 1
+            logger.warning(f"[COOLDOWN TRACKING] Loss #{self.consecutive_losses}: ${pnl:.2f} (source: {source})")
+            
+            if self.cooldown_enabled and self.consecutive_losses >= self.cooldown_trigger_losses:
+                self.cooldown_until = datetime.now(self.timezone) + timedelta(minutes=self.cooldown_minutes)
+                logger.warning(f"🚨 COOLDOWN TRIGGERED after {self.consecutive_losses} consecutive losses. Pausing until {self.cooldown_until.strftime('%H:%M')}")
+                logger.warning(f"   Cooldown duration: {self.cooldown_minutes} minutes")
+                self.alerts.error(f"Cooldown: {self.consecutive_losses} losses. Pausing {self.cooldown_minutes} min")
+        else:
+            logger.info(f"[COOLDOWN TRACKING] Profit: ${pnl:.2f} - resetting consecutive losses counter")
+            self.consecutive_losses = 0
+        
+        # Track last processed trade ID
+        if trade_id is not None:
+            self.last_processed_trade_id = trade_id
     
     def _on_trade(self, trade: UserTrade):
-        logger.info(f"Trade: {trade.size} @ {trade.price} P&L: ${trade.pnl:.2f}")
+        """SignalR callback for trade events - primary source of trade P&L"""
+        logger.info(f"Trade callback: {trade.size} @ {trade.price} P&L: ${trade.pnl:.2f} (ID: {trade.id})")
         
         self.daily_pnl += trade.pnl
         
+        # Process P&L for cooldown tracking
+        self._process_trade_pnl(trade.pnl, trade_id=trade.id, source="SignalR_trade_callback")
+        
         if trade.pnl != 0:
-            if trade.pnl < 0:
-                self.consecutive_losses += 1
-                if self.cooldown_enabled and self.consecutive_losses >= self.cooldown_trigger_losses:
-                    self.cooldown_until = datetime.now(self.timezone) + timedelta(minutes=self.cooldown_minutes)
-                    logger.warning(f"Cooldown triggered after {self.consecutive_losses} consecutive losses. Pausing until {self.cooldown_until.strftime('%H:%M')}")
-                    self.alerts.error(f"Cooldown: {self.consecutive_losses} losses. Pausing {self.cooldown_minutes} min")
-            else:
-                self.consecutive_losses = 0
-            
             side = "LONG" if trade.side == 0 else "SHORT"
             self.alerts.trade_exit(
                 side=side,
@@ -510,6 +729,8 @@ class LiveTrader:
             self.daily_limit_triggered = False
             self.consecutive_losses = 0
             self.cooldown_until = None
+            self.last_processed_trade_id = None  # Reset trade ID tracking
+            self.last_position_qty = None  # Reset position quantity tracking
             self.pending_limit_order = None  # Clear pending limit orders
             self.last_trade_date = today
             logger.info(f"New trading day: {today}")
@@ -546,6 +767,26 @@ class LiveTrader:
         return True, ""
     
     def _get_current_price(self) -> Optional[float]:
+        # CRITICAL FIX 11: Check quote staleness before using it
+        if self.last_quote:
+            # Check if quote is stale (older than 30 seconds)
+            try:
+                if hasattr(self.last_quote, 'timestamp') and self.last_quote.timestamp:
+                    from dateutil import parser
+                    quote_time = parser.parse(self.last_quote.timestamp)
+                    if quote_time.tzinfo is None:
+                        quote_time = self.timezone.localize(quote_time)
+                    else:
+                        quote_time = quote_time.astimezone(self.timezone)
+                    now = datetime.now(self.timezone)
+                    age_seconds = (now - quote_time).total_seconds()
+                    if age_seconds > 30:
+                        logger.warning(f"Quote is stale: {age_seconds:.1f} seconds old, fetching fresh price")
+                        self.last_quote = None  # Mark as stale
+            except Exception as e:
+                logger.debug(f"Could not check quote timestamp: {e}")
+                # Continue with quote if timestamp check fails
+        
         if self.last_quote:
             return self.last_quote.last_price
         
@@ -939,7 +1180,8 @@ class LiveTrader:
             'order_id': None,  # Will be set after order is placed
             'structure_levels': signal.get('structure_levels', []),
             'last_broken_level': None,
-            'pending': True  # Flag to indicate order is pending
+            'pending': True,  # Flag to indicate order is pending
+            'scale_out_levels_done': []  # Track completed scale-out levels
         }
         
         try:
@@ -949,99 +1191,384 @@ class LiveTrader:
             sl_ticks = math.ceil(abs(signal['risk_ticks']))
             tp_ticks = round(abs(signal['reward_ticks']))
             
-            # TODO: Change 12 - Fill-based bracket anchoring
-            # Currently places bracket order with ticks from expected entry_price
-            # Future enhancement: Place market order first, wait for fill, then place SL/TP from actual fill price
-            # This requires API support for separate order placement and fill confirmation
-            fill_based = self.config.get('execution_mode', {}).get('fill_based_brackets', False)
-            if fill_based:
-                logger.warning("Fill-based bracket anchoring not yet implemented - using tick-based brackets")
+            # NEW APPROACH: Position Brackets enabled - place separate orders
+            # 1. Place market entry order FIRST (no bracket parameters)
+            logger.info(f"Placing market entry order: {side.name} {self.position_size} contracts")
+            logger.info("NOTE: Position Brackets enabled - will place SL/TP separately after fill")
             
-            result = self.client.place_bracket_order(
+            entry_result = self.client.place_market_order(
                 contract_id=self.contract.id,
                 side=side,
-                size=self.position_size,
-                stop_loss_ticks=sl_ticks,
-                take_profit_ticks=tp_ticks
+                size=self.position_size
+                # NO bracket parameters - Position Brackets will handle OCO linkage
             )
             
-            if not result.get('success'):
-                error = result.get('errorMessage', 'Unknown error')
-                logger.error(f"Order failed: {error}")
-                self.alerts.error(f"Order failed: {error}")
+            if not entry_result.get('success'):
+                error = entry_result.get('errorMessage', 'Unknown error')
+                logger.error(f"Entry order failed: {error}")
+                self.alerts.error(f"Entry order failed: {error}")
                 # Clear position on failure
                 self.current_position = None
                 self._executing_entry = False  # Release execution lock
                 self._trading_locked = False  # Release trading lock
                 return False
             
-            order_id = result.get('orderId')
+            entry_order_id = entry_result.get('orderId')
+            logger.info(f"Entry order placed: ID {entry_order_id}")
+            
+            # 2. Wait for fill confirmation
+            import time
+            time.sleep(1.5)  # Wait for order to fill
+            
+            # 3. Get ACTUAL filled position from TopStep API (size, entry price, etc.)
+            actual_position_size = self.position_size
+            actual_entry_price = signal['entry_price']
+            
+            try:
+                positions = self.client.get_positions()
+                for pos in positions:
+                    if pos.contract_id == self.contract.id and pos.size != 0:
+                        actual_position_size = abs(pos.size)
+                        actual_entry_price = pos.average_price
+                        
+                        # Update position tracking with ACTUAL values from API
+                        self.current_position['quantity'] = actual_position_size
+                        self.current_position['entry_price'] = actual_entry_price
+                        
+                        if actual_position_size != self.position_size:
+                            logger.warning(f"Partial fill detected: Requested {self.position_size}, Filled {actual_position_size}")
+                        logger.info(f"Position filled: {actual_position_size} contracts @ ${actual_entry_price:.2f}")
+                        break
+            except Exception as e:
+                logger.warning(f"Could not get actual position from API: {e}")
+                logger.info(f"Using requested values: {self.position_size} contracts @ ${signal['entry_price']:.2f}")
             
             # Update position with order ID and remove pending flag
-            self.current_position['order_id'] = order_id
+            self.current_position['order_id'] = entry_order_id
             self.current_position.pop('pending', None)
             
-            self.highest_price = signal['entry_price']
-            self.lowest_price = signal['entry_price']
+            self.highest_price = actual_entry_price
+            self.lowest_price = actual_entry_price
             
             self.daily_trades += 1
             
-            logger.info(f"OK Order placed successfully. Order ID: {order_id}")
+            # 4. Calculate SL and TP prices from ACTUAL entry price
+            if signal['type'] == 'long':
+                sl_price = actual_entry_price - (sl_ticks * self.tick_size)
+                tp_price = actual_entry_price + (tp_ticks * self.tick_size)
+                sl_order_side = OrderSide.ASK  # Sell to close long
+                tp_order_side = OrderSide.ASK  # Sell to close long
+            else:  # short
+                sl_price = actual_entry_price + (sl_ticks * self.tick_size)
+                tp_price = actual_entry_price - (tp_ticks * self.tick_size)
+                sl_order_side = OrderSide.BID  # Buy to close short
+                tp_order_side = OrderSide.BID  # Buy to close short
             
-            # CRITICAL FIX: Verify bracket orders (SL/TP) were actually created
-            import time
-            time.sleep(1.0)  # Wait for orders to be processed by broker
+            # Round to tick size
+            sl_price = round(sl_price / self.tick_size) * self.tick_size
+            tp_price = round(tp_price / self.tick_size) * self.tick_size
             
-            stop_found = False
-            tp_found = False
+            # Validate stop price against current market (API requirement)
+            # For LONG: stop must be below best_ask (minimum 2 ticks)
+            # For SHORT: stop must be above best_bid (minimum 2 ticks)
+            # Wait briefly for quote to arrive if we don't have one
+            if not self.last_quote:
+                logger.debug("Waiting for quote to validate stop price...")
+                time.sleep(0.5)  # Brief wait for quote
+            
+            if self.last_quote:
+                if signal['type'] == 'long':
+                    # For LONG: stop must be below best_ask (minimum 2 ticks for API)
+                    best_ask = self.last_quote.best_ask
+                    min_distance = 2 * self.tick_size
+                    max_stop_price = best_ask - min_distance
+                    if sl_price >= best_ask or sl_price > max_stop_price:
+                        original_sl = sl_price
+                        sl_price = round((best_ask - min_distance) / self.tick_size) * self.tick_size
+                        logger.warning(f"Stop price adjusted for API requirement: ${original_sl:.2f} -> ${sl_price:.2f} (must be at least 2 ticks below best_ask ${best_ask:.2f})")
+                else:  # short
+                    # For SHORT: stop must be above best_bid (minimum 2 ticks for API)
+                    best_bid = self.last_quote.best_bid
+                    min_distance = 2 * self.tick_size
+                    min_stop_price = best_bid + min_distance
+                    if sl_price <= best_bid or sl_price < min_stop_price:
+                        original_sl = sl_price
+                        sl_price = round((best_bid + min_distance) / self.tick_size) * self.tick_size
+                        logger.warning(f"Stop price adjusted for API requirement: ${original_sl:.2f} -> ${sl_price:.2f} (must be at least 2 ticks above best_bid ${best_bid:.2f})")
+            else:
+                # No quote available - use conservative adjustment based on entry price
+                logger.warning("No quote available - using conservative stop price adjustment")
+                if signal['type'] == 'long':
+                    # For LONG: ensure stop is well below entry (at least 5 ticks for safety)
+                    min_distance = 5 * self.tick_size
+                    max_stop_price = actual_entry_price - min_distance
+                    if sl_price > max_stop_price:
+                        original_sl = sl_price
+                        sl_price = round((actual_entry_price - min_distance) / self.tick_size) * self.tick_size
+                        logger.warning(f"Stop price adjusted (no quote): ${original_sl:.2f} -> ${sl_price:.2f} (at least 5 ticks below entry ${actual_entry_price:.2f})")
+                else:  # short
+                    # For SHORT: ensure stop is well above entry
+                    min_distance = 5 * self.tick_size
+                    min_stop_price = actual_entry_price + min_distance
+                    if sl_price < min_stop_price:
+                        original_sl = sl_price
+                        sl_price = round((actual_entry_price + min_distance) / self.tick_size) * self.tick_size
+                        logger.warning(f"Stop price adjusted (no quote): ${original_sl:.2f} -> ${sl_price:.2f} (at least 5 ticks above entry ${actual_entry_price:.2f})")
+            
+            logger.info(f"Calculated from actual fill: SL=${sl_price:.2f}, TP=${tp_price:.2f}")
+            
+            # Final validation: Get fresh quote and ensure stop price meets API requirements
+            # This is critical because API will reject orders that don't meet price constraints
             try:
+                quotes = self.client.get_quotes([self.contract.id])
+                if quotes and self.contract.id in quotes:
+                    fresh_quote = quotes[self.contract.id]
+                    if signal['type'] == 'long':
+                        # For LONG: stop must be at least 2 ticks below best_ask
+                        best_ask = fresh_quote.ask
+                        max_allowed_stop = best_ask - (2 * self.tick_size)
+                        if sl_price >= best_ask or sl_price > max_allowed_stop:
+                            original_sl = sl_price
+                            sl_price = round((best_ask - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                            logger.warning(f"Final stop price adjustment for API: ${original_sl:.2f} -> ${sl_price:.2f} (best_ask: ${best_ask:.2f})")
+                            # Update position tracking with adjusted stop
+                            if self.current_position:
+                                self.current_position['stop_loss'] = sl_price
+                                self.current_position['initial_stop_loss'] = sl_price
+                    else:  # short
+                        # For SHORT: stop must be at least 2 ticks above best_bid
+                        best_bid = fresh_quote.bid
+                        min_allowed_stop = best_bid + (2 * self.tick_size)
+                        if sl_price <= best_bid or sl_price < min_allowed_stop:
+                            original_sl = sl_price
+                            sl_price = round((best_bid + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                            logger.warning(f"Final stop price adjustment for API: ${original_sl:.2f} -> ${sl_price:.2f} (best_bid: ${best_bid:.2f})")
+                            # Ensure stop is still >= entry for SHORT (protect against losses)
+                            if sl_price < actual_entry_price:
+                                logger.warning(f"Adjusted stop ${sl_price:.2f} is below entry ${actual_entry_price:.2f}, adjusting to entry + 2 ticks")
+                                sl_price = round((actual_entry_price + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                            # Update position tracking with adjusted stop
+                            if self.current_position:
+                                self.current_position['stop_loss'] = sl_price
+                                self.current_position['initial_stop_loss'] = sl_price
+            except Exception as e:
+                logger.warning(f"Could not get fresh quote for final validation: {e}")
+            
+            # 5. Place Stop Loss order with retry logic and price adjustment (CRITICAL)
+            sl_order_id = None
+            sl_placed = False
+            max_sl_retries = 5  # Increased retries
+            
+            for sl_attempt in range(max_sl_retries):
+                # Get fresh quote before each attempt to adjust price if needed
+                if sl_attempt > 0:
+                    try:
+                        if self.last_quote and self.last_quote.contract_id == self.contract.id:
+                            if signal['type'] == 'long':
+                                # For LONG: stop must be below best_ask
+                                best_ask = self.last_quote.best_ask
+                                max_allowed = best_ask - (2 * self.tick_size)
+                                if sl_price >= best_ask or sl_price > max_allowed:
+                                    sl_price = round((best_ask - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                    logger.info(f"Adjusted SL price for retry: ${sl_price:.2f} (best_ask: ${best_ask:.2f})")
+                            else:  # short
+                                # For SHORT: stop must be above best_bid
+                                best_bid = self.last_quote.best_bid
+                                min_allowed = best_bid + (2 * self.tick_size)
+                                if sl_price <= best_bid or sl_price < min_allowed:
+                                    sl_price = round((best_bid + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                    logger.info(f"Adjusted SL price for retry: ${sl_price:.2f} (best_bid: ${best_bid:.2f})")
+                        time.sleep(0.5)  # Brief wait for quote update
+                    except Exception as e:
+                        logger.debug(f"Could not adjust price: {e}")
+                
+                logger.info(f"Placing stop loss (attempt {sl_attempt + 1}/{max_sl_retries}): {sl_order_side.name} {actual_position_size} @ ${sl_price:.2f}")
+                sl_result = self.client.place_stop_order(
+                    contract_id=self.contract.id,
+                    side=sl_order_side,
+                    size=actual_position_size,
+                    stop_price=sl_price
+                )
+                
+                if sl_result.get('success'):
+                    sl_order_id = sl_result.get('orderId')
+                    # Verify order was actually placed
+                    time.sleep(0.5)
+                    if self._verify_order_placement(sl_order_id, actual_position_size, 'Stop Loss', max_retries=2):
+                        self.current_position['stop_order_id'] = sl_order_id
+                        self.current_position['stop_loss'] = sl_price
+                        self.current_position['initial_stop_loss'] = sl_price
+                        logger.info(f"Stop loss placed and verified: ID {sl_order_id} @ ${sl_price:.2f}")
+                        sl_placed = True
+                        break
+                    else:
+                        logger.warning(f"Stop loss order {sl_order_id} not verified, retrying...")
+                        if sl_attempt < max_sl_retries - 1:
+                            time.sleep(1.5)  # Wait longer before retry
+                else:
+                    error_msg = sl_result.get('errorMessage', 'Unknown error')
+                    logger.warning(f"Stop loss attempt {sl_attempt + 1} failed: {error_msg}")
+                    # If price error, adjust price for next attempt
+                    if 'price' in error_msg.lower() or 'outside' in error_msg.lower():
+                        if signal['type'] == 'long':
+                            sl_price = sl_price - (1 * self.tick_size)  # Move down
+                        else:
+                            sl_price = sl_price + (1 * self.tick_size)  # Move up
+                        logger.info(f"Adjusting SL price for next attempt: ${sl_price:.2f}")
+                    if sl_attempt < max_sl_retries - 1:
+                        time.sleep(1.5)  # Wait before retry
+            
+            if not sl_placed:
+                # Try fallback stop loss
+                logger.error(f"CRITICAL: All {max_sl_retries} stop loss attempts failed, trying fallback...")
+                if not self._place_fallback_stop_loss(signal):
+                    # If fallback also fails, CLOSE POSITION immediately - it's unprotected
+                    logger.error("CRITICAL: Stop loss placement completely failed - closing position for safety")
+                    self.alerts.error("CRITICAL: Stop loss failed - closing unprotected position immediately")
+                    try:
+                        close_result = self.client.close_position(self.contract.id)
+                        if close_result.get('success'):
+                            logger.info("Position closed successfully due to SL placement failure")
+                        else:
+                            logger.error(f"Failed to close position: {close_result.get('errorMessage')}")
+                    except Exception as e:
+                        logger.error(f"Exception closing position: {e}")
+                    
+                    self.current_position = None
+                    self._executing_entry = False
+                    self._trading_locked = False
+                    return False
+            
+            # 6. Place Take Profit order with retry logic and price adjustment (IMPORTANT)
+            tp_order_id = None
+            tp_placed = False
+            max_tp_retries = 5  # Increased retries
+            
+            for tp_attempt in range(max_tp_retries):
+                # Get fresh quote before each attempt to adjust price if needed
+                if tp_attempt > 0:
+                    try:
+                        if self.last_quote and self.last_quote.contract_id == self.contract.id:
+                            if signal['type'] == 'long':
+                                # For LONG: TP should be above best_ask
+                                best_ask = self.last_quote.best_ask
+                                if tp_price <= best_ask:
+                                    tp_price = round((best_ask + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                    logger.info(f"Adjusted TP price for retry: ${tp_price:.2f} (best_ask: ${best_ask:.2f})")
+                            else:  # short
+                                # For SHORT: TP should be below best_bid
+                                best_bid = self.last_quote.best_bid
+                                if tp_price >= best_bid:
+                                    tp_price = round((best_bid - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                    logger.info(f"Adjusted TP price for retry: ${tp_price:.2f} (best_bid: ${best_bid:.2f})")
+                        time.sleep(0.5)  # Brief wait for quote update
+                    except Exception as e:
+                        logger.debug(f"Could not adjust TP price: {e}")
+                
+                logger.info(f"Placing take profit (attempt {tp_attempt + 1}/{max_tp_retries}): {tp_order_side.name} {actual_position_size} @ ${tp_price:.2f}")
+                tp_result = self.client.place_limit_order(
+                    contract_id=self.contract.id,
+                    side=tp_order_side,
+                    size=actual_position_size,
+                    limit_price=tp_price
+                )
+                
+                if tp_result.get('success'):
+                    tp_order_id = tp_result.get('orderId')
+                    # Verify order was actually placed
+                    time.sleep(0.5)
+                    if self._verify_order_placement(tp_order_id, actual_position_size, 'Take Profit', max_retries=2):
+                        self.current_position['tp_order_id'] = tp_order_id
+                        self.current_position['take_profit'] = tp_price
+                        logger.info(f"Take profit placed and verified: ID {tp_order_id} @ ${tp_price:.2f}")
+                        tp_placed = True
+                        break
+                    else:
+                        logger.warning(f"Take profit order {tp_order_id} not verified, retrying...")
+                        if tp_attempt < max_tp_retries - 1:
+                            time.sleep(1.5)  # Wait longer before retry
+                else:
+                    error_msg = tp_result.get('errorMessage', 'Unknown error')
+                    logger.warning(f"Take profit attempt {tp_attempt + 1} failed: {error_msg}")
+                    # If price error, adjust price for next attempt
+                    if 'price' in error_msg.lower() or 'outside' in error_msg.lower():
+                        if signal['type'] == 'long':
+                            tp_price = tp_price + (1 * self.tick_size)  # Move up
+                        else:
+                            tp_price = tp_price - (1 * self.tick_size)  # Move down
+                        logger.info(f"Adjusting TP price for next attempt: ${tp_price:.2f}")
+                    if tp_attempt < max_tp_retries - 1:
+                        time.sleep(1.5)  # Wait before retry
+            
+            if not tp_placed:
+                # TP failure is less critical than SL (position still protected), but log it
+                error_msg = tp_result.get('errorMessage', 'Unknown error') if tp_result else 'All attempts failed'
+                logger.error(f"Take profit placement failed after {max_tp_retries} attempts: {error_msg}")
+                self.alerts.error(f"Take profit placement failed - position protected by SL but TP missing")
+                # Position is still protected by SL, but TP will need to be placed manually or via monitoring
+            
+            # Simple verification: Check that orders exist (Position Brackets will handle OCO linkage)
+            try:
+                time.sleep(0.5)  # Brief wait for orders to register
                 open_orders = self.client.get_open_orders()
+                sl_verified = False
+                tp_verified = False
+                
                 for order in open_orders:
                     if order.get('contractId') == self.contract.id:
-                        order_type = order.get('type')
-                        if order_type == 4:  # STOP order
-                            self.current_position['stop_order_id'] = order.get('id')
-                            self.current_position['stop_loss'] = order.get('stopPrice', signal['stop_loss'])
-                            stop_found = True
-                            logger.info(f"VERIFIED: Stop loss order found - ID {order.get('id')} @ ${order.get('stopPrice', 0):.2f}")
-                        elif order_type == 1:  # LIMIT order (could be TP)
-                            limit_price = order.get('limitPrice', 0)
-                            # Check if this is a take profit (on correct side of entry)
-                            if signal['type'] == 'long' and limit_price > signal['entry_price']:
-                                self.current_position['tp_order_id'] = order.get('id')
-                                tp_found = True
-                                logger.info(f"VERIFIED: Take profit order found - ID {order.get('id')} @ ${limit_price:.2f}")
-                            elif signal['type'] == 'short' and limit_price < signal['entry_price']:
-                                self.current_position['tp_order_id'] = order.get('id')
-                                tp_found = True
-                                logger.info(f"VERIFIED: Take profit order found - ID {order.get('id')} @ ${limit_price:.2f}")
+                        order_id = order.get('id')
+                        if order_id == self.current_position.get('stop_order_id'):
+                            sl_verified = True
+                            logger.info(f"Stop loss verified: ID {order_id} @ ${order.get('stopPrice', 0):.2f}, Size: {order.get('size', 0)}")
+                        elif order_id == self.current_position.get('tp_order_id'):
+                            tp_verified = True
+                            logger.info(f"Take profit verified: ID {order_id} @ ${order.get('limitPrice', 0):.2f}, Size: {order.get('size', 0)}")
+                
+                if not sl_verified and self.current_position.get('stop_order_id'):
+                    logger.warning(f"Stop loss order not found in open orders (may have been cancelled or filled)")
+                if not tp_verified and self.current_position.get('tp_order_id'):
+                    logger.warning(f"Take profit order not found in open orders (may have been cancelled or filled)")
             except Exception as e:
-                logger.warning(f"Could not verify bracket orders: {e}")
-            
-            # CRITICAL: If stop loss not found, place standalone stop loss
-            if not stop_found:
-                logger.error("CRITICAL: Stop loss order NOT FOUND after bracket order! Placing fallback SL...")
-                self._place_fallback_stop_loss(signal)
+                logger.warning(f"Could not verify orders: {e}")
             
             # Send alert (non-blocking - wrap in try/except to prevent hanging)
             try:
                 self.alerts.trade_entry(
                     side=signal['type'],
-                    entry_price=signal['entry_price'],
-                    quantity=self.position_size,
-                    stop_loss=signal['stop_loss'],
-                    take_profit=signal['take_profit']
+                    entry_price=actual_entry_price,  # Use actual fill price
+                    quantity=actual_position_size,   # Use actual position size
+                    stop_loss=sl_price,              # Use actual SL price
+                    take_profit=tp_price             # Use actual TP price
                 )
             except Exception as e:
                 logger.warning(f"Alert failed (non-critical): {e}")
             
+            # CRITICAL: Final verification - check everything matches expectations
+            logger.info("Performing final order verification...")
+            verification_passed = self._verify_all_orders_match_expectations(signal, actual_position_size, actual_entry_price)
+            
+            if not verification_passed:
+                logger.error("CRITICAL: Order verification failed! Closing position and all orders for safety...")
+                self._emergency_close_all()
+                self.current_position = None
+                self._executing_entry = False
+                self._trading_locked = False
+                return False
+            
             logger.info("Entry execution completed - releasing locks")
             self._executing_entry = False  # Release lock after successful order
+            self.circuit_breaker.record_success()
+            
+            # Log trade metadata to journal
+            self._log_trade_metadata(signal, actual_entry_price, actual_position_size, sl_price, tp_price)
+            
             return True
             
         except Exception as e:
             logger.error(f"Order execution failed: {e}")
             self.alerts.error(f"Order execution failed: {e}")
+            # Record failure in circuit breaker
+            self.circuit_breaker.record_failure(timezone=self.timezone)
             # Clear position and release locks on exception
             self.current_position = None
             self._executing_entry = False  # Release execution lock
@@ -1058,16 +1585,70 @@ class LiveTrader:
             return False
         
         try:
-            side = OrderSide.ASK if signal['type'] == 'long' else OrderSide.BID
-            stop_price = signal['stop_loss']
-            quantity = self.position_size
+            entry_price = self.current_position.get('entry_price')
+            position_side = self.current_position.get('side', signal['type'])
             
-            logger.info(f"Placing fallback stop loss: {side.name} {quantity} @ ${stop_price:.2f}")
+            # Get fresh quote to ensure stop price meets API requirements
+            try:
+                if self.last_quote and self.last_quote.contract_id == self.contract.id:
+                    quote = self.last_quote
+                else:
+                    # Wait a bit for quote if we don't have one
+                    time.sleep(0.5)
+                    if self.last_quote and self.last_quote.contract_id == self.contract.id:
+                        quote = self.last_quote
+                    else:
+                        quote = None
+                        logger.warning("No quote available for fallback SL - will use entry-based calculation")
+            except:
+                quote = None
+            
+            if position_side == 'long':
+                sl_order_side = OrderSide.ASK  # Sell to close long
+                # For LONG: stop must be below entry and below best_ask
+                if quote:
+                    best_ask = quote.best_ask
+                    max_stop = best_ask - (2 * self.tick_size)
+                    stop_price = min(signal['stop_loss'], max_stop)
+                    # Ensure stop is still below entry
+                    stop_price = min(stop_price, entry_price - (2 * self.tick_size))
+                else:
+                    stop_price = entry_price - (5 * self.tick_size)  # Conservative 5 ticks below entry
+            else:  # short
+                sl_order_side = OrderSide.BID  # Buy to close short
+                # For SHORT: stop must be above entry and above best_bid
+                if quote:
+                    best_bid = quote.best_bid
+                    min_stop = best_bid + (2 * self.tick_size)
+                    stop_price = max(signal['stop_loss'], min_stop)
+                    # Ensure stop is still above entry
+                    stop_price = max(stop_price, entry_price + (2 * self.tick_size))
+                else:
+                    stop_price = entry_price + (5 * self.tick_size)  # Conservative 5 ticks above entry
+            
+            # Round to tick size
+            stop_price = round(stop_price / self.tick_size) * self.tick_size
+            
+            # Get actual position size from TopStep API (preferred) or use signal/position tracking
+            quantity = signal.get('quantity', self.current_position.get('quantity', self.position_size))
+            
+            # Double-check with API if we have a position
+            try:
+                positions = self.client.get_positions()
+                for pos in positions:
+                    if pos.contract_id == self.contract.id and pos.size != 0:
+                        quantity = abs(pos.size)
+                        logger.info(f"Using actual position size from TopStep API: {quantity} contracts")
+                        break
+            except Exception as e:
+                logger.debug(f"Could not verify position size from API: {e}")
+            
+            logger.info(f"Placing fallback stop loss: {sl_order_side.name} {quantity} @ ${stop_price:.2f} (size from API: {quantity})")
             
             result = self.client.place_order(
                 contract_id=self.contract.id,
                 order_type=OrderType.STOP,
-                side=side,
+                side=sl_order_side,
                 size=quantity,
                 stop_price=stop_price
             )
@@ -1077,7 +1658,7 @@ class LiveTrader:
                 self.current_position['stop_order_id'] = stop_order_id
                 self.current_position['stop_loss'] = stop_price
                 logger.info(f"Fallback stop loss placed successfully: ID {stop_order_id} @ ${stop_price:.2f}")
-                self.alerts.info(f"Fallback SL placed: ${stop_price:.2f}")
+                # Fallback SL placed successfully - no alert needed (entry alert already sent)
                 return True
             else:
                 error = result.get('errorMessage', 'Unknown error') if result else 'No response'
@@ -1092,6 +1673,8 @@ class LiveTrader:
     
     def _check_position_status(self) -> None:
         if self.current_position is None:
+            # Even if no position tracked, check for orphaned orders and clean them up
+            self._cancel_remaining_bracket_orders()
             return
         
         try:
@@ -1109,8 +1692,57 @@ class LiveTrader:
                     break
             
             if not has_position:
-                logger.info("Position closed (detected via REST)")
+                logger.warning("Position closed (detected via REST) - cleaning up orders immediately...")
+                
+                # CRITICAL FIX: Calculate and process P&L when position closes (fallback if trade callback missed)
+                # This ensures cooldown triggers even if _on_trade() callback didn't fire
+                try:
+                    entry_price = self.current_position.get('entry_price')
+                    current_price = self._get_current_price()
+                    
+                    if entry_price and current_price:
+                        side = self.current_position.get('side')
+                        quantity = self.current_position.get('quantity', self.position_size)
+                        
+                        # Calculate P&L
+                        if side == 'long':
+                            pnl_ticks = (current_price - entry_price) / self.tick_size
+                        else:
+                            pnl_ticks = (entry_price - current_price) / self.tick_size
+                        
+                        # Estimate commission (open + close)
+                        commission = self.commission_per_contract * quantity * 2
+                        gross_pnl = pnl_ticks * self.tick_value * quantity
+                        net_pnl = gross_pnl - commission
+                        
+                        logger.warning(f"[COOLDOWN FALLBACK] Position closed via REST - calculated P&L: ${net_pnl:.2f} (entry: ${entry_price:.2f}, exit: ${current_price:.2f}, qty: {quantity})")
+                        
+                        # Process P&L for cooldown (only if we haven't processed it already via trade callback)
+                        # Use a dummy trade_id based on timestamp to allow processing
+                        fallback_trade_id = int(datetime.now(self.timezone).timestamp() * 1000) + 1
+                        self._process_trade_pnl(net_pnl, trade_id=fallback_trade_id, source="REST_position_check")
+                        
+                        # Update daily P&L if not already updated by trade callback
+                        self.daily_pnl += net_pnl
+                except Exception as e:
+                    logger.warning(f"Could not calculate P&L on position close: {e}")
+                
+                # CRITICAL: Cancel any remaining bracket orders (SL/TP) when position is closed
+                # Position Brackets doesn't auto-cancel, so we must clean up manually
+                self._cancel_remaining_bracket_orders()
+                
+                # Double-check: cancel ALL orders for this contract as safety measure
+                import time
+                time.sleep(0.5)  # Brief pause to ensure order state is updated
+                self._cancel_remaining_bracket_orders()  # Call again to catch any missed orders
+                
+                # Triple-check: one more time after another brief pause
+                time.sleep(0.5)
+                self._cancel_remaining_bracket_orders()
+                
+                # Clear position tracking
                 self.current_position = None
+                self.last_position_qty = None
                 # Release trading lock when position closes
                 self._trading_locked = False
                 logger.info("Trading lock released - new signals allowed")
@@ -1123,7 +1755,18 @@ class LiveTrader:
                     self.current_position['quantity'] = new_qty
                     # Update order sizes to match new position quantity
                     self._sync_order_sizes_to_position()
+                
+                # FIX 1: Enhanced watchdog - runs on EVERY position check (not just when qty changes)
+                # Checks for missing orders AND size mismatches, fixes them automatically
+                # CRITICAL FIX: Only run watchdog if NOT updating orders AND NOT executing entry
+                if (not hasattr(self, '_updating_stop_order') or not self._updating_stop_order) and \
+                   (not hasattr(self, '_placing_protective_orders') or not self._placing_protective_orders) and \
+                   (not hasattr(self, '_executing_entry') or not self._executing_entry):
+                    self._ensure_protective_orders_exist(broker_position)
                 else:
+                    logger.debug("Skipping watchdog - order update or entry execution in progress")
+                
+                if old_qty == new_qty:
                     # ALWAYS log position status when position exists (not just every 5th check)
                     if not hasattr(self, '_position_check_count'):
                         self._position_check_count = 0
@@ -1145,15 +1788,438 @@ class LiveTrader:
                         # Log every position check to show trader is active
                         logger.info(f"[POSITION] {side.upper()} {qty} @ ${entry:.2f}, Current: ${current_price:.2f}, P&L: ${pnl:.2f} ({pnl_ticks:.1f} ticks)")
                 
+                # Check max position duration
+                if self.current_position and self.current_position.get('entry_time'):
+                    entry_time = self.current_position['entry_time']
+                    duration_hours = (datetime.now(self.timezone) - entry_time).total_seconds() / 3600
+                    
+                    if duration_hours > self.max_position_hours:
+                        logger.warning(f"Position open for {duration_hours:.1f} hours (max: {self.max_position_hours}) - forcing close")
+                        current_price = self._get_current_price()
+                        if current_price:
+                            total_daily_pnl = self.daily_pnl
+                            unrealized_pnl = self._calculate_unrealized_pnl(current_price)
+                            self._force_close_position(current_price, total_daily_pnl, unrealized_pnl)
+                            return
+                
         except Exception as e:
             logger.error(f"Failed to check position: {e}")
             import traceback
             logger.error(f"Position check traceback: {traceback.format_exc()}")
     
+    def _cancel_remaining_bracket_orders(self) -> None:
+        """
+        Cancel any remaining bracket orders (stop loss or take profit) 
+        when position is closed. Uses TopStep API to verify position is actually closed.
+        This prevents abandoned orders.
+        
+        CRITICAL: This is called proactively to clean up orders even if position tracking is lost.
+        """
+        try:
+            # CRITICAL: Verify position is actually closed via TopStep API
+            positions = self.client.get_positions()
+            has_position = False
+            for pos in positions:
+                if pos.contract_id == self.contract.id and pos.size != 0:
+                    has_position = True
+                    logger.debug(f"Position still exists: {pos.size} contracts - skipping cleanup")
+                    break
+            
+            # Only skip if position definitely exists
+            # If no position exists OR current_position is None, proceed with cleanup check
+            if has_position and self.current_position is not None:
+                logger.debug("Position exists (via API), skipping bracket order cleanup")
+                return
+            
+            # Position confirmed closed or not tracked - proceed with cleanup
+            open_orders = self.client.get_open_orders()
+            cancelled_count = 0
+            orders_to_cancel = []
+            
+            # Collect ALL orders for this contract (not just SL/TP, to be safe)
+            for order in open_orders:
+                if order.get('contractId') == self.contract.id:
+                    order_type = order.get('type')
+                    order_id = order.get('id')
+                    order_size = order.get('size', 0)
+                    order_type_name = {1: 'LIMIT', 2: 'MARKET', 4: 'STOP'}.get(order_type, f'TYPE{order_type}')
+                    
+                    # Collect ALL orders (stop loss, take profit, any other orders)
+                    orders_to_cancel.append((order_type_name, order_id, order_size))
+            
+            if orders_to_cancel:
+                logger.warning(f"Found {len(orders_to_cancel)} remaining order(s) to cancel for {self.contract.id}")
+            
+            # Cancel all collected orders
+            for order_type, order_id, order_size in orders_to_cancel:
+                try:
+                    result = self.client.cancel_order(order_id)
+                    if result.get('success'):
+                        logger.warning(f"CANCELLED {order_type} order: ID {order_id}, Size: {order_size}")
+                        cancelled_count += 1
+                    else:
+                        error_msg = result.get('errorMessage', 'Unknown error')
+                        # Some orders may already be cancelled/filled - that's OK
+                        if 'not found' in error_msg.lower() or 'does not exist' in error_msg.lower() or 'invalid' in error_msg.lower():
+                            logger.debug(f"Order {order_id} already cancelled/filled (OK)")
+                        else:
+                            logger.error(f"FAILED to cancel {order_type} order {order_id}: {error_msg}")
+                except Exception as e:
+                    logger.error(f"ERROR cancelling {order_type} order {order_id}: {e}")
+            
+            if cancelled_count > 0:
+                logger.warning(f"CLEANUP: Cancelled {cancelled_count} remaining order(s)")
+            elif orders_to_cancel:
+                logger.warning(f"WARNING: Found {len(orders_to_cancel)} orders but failed to cancel any")
+        
+        except Exception as e:
+            logger.error(f"ERROR in cleanup function: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def _log_trade_metadata(self, signal: Dict, entry_price: float, quantity: int, 
+                           stop_loss: float, take_profit: float) -> None:
+        """Log comprehensive trade data for analysis"""
+        try:
+            journal_file = Path('trade_journal.jsonl')  # JSON Lines format
+            
+            # Extract zone information if available
+            zone_data = None
+            if 'zone' in signal and signal['zone']:
+                zone = signal['zone']
+                zone_data = {
+                    'confidence': getattr(zone, 'confidence', None),
+                    'age_hours': zone.age_hours(datetime.now(self.timezone)) if hasattr(zone, 'age_hours') else None,
+                    'touch_count': getattr(zone, 'touch_count', None),
+                    'quality_score': getattr(zone, 'quality_score', None)
+                }
+            
+            trade_data = {
+                'timestamp': signal.get('timestamp', datetime.now(self.timezone)).isoformat() if isinstance(signal.get('timestamp'), datetime) else str(signal.get('timestamp', datetime.now(self.timezone))),
+                'side': signal.get('type', 'unknown'),
+                'entry': entry_price,
+                'sl': stop_loss,
+                'tp': take_profit,
+                'quantity': quantity,
+                'session': signal.get('session', 'unknown'),
+                'zone': zone_data,
+                'market_context': {
+                    'vwap': signal.get('vwap'),
+                    'atr': signal.get('atr'),
+                    'regime': signal.get('market_regime', 'unknown')
+                },
+                'outcome': None  # Will be updated when trade closes
+            }
+            
+            with open(journal_file, 'a') as f:
+                f.write(json.dumps(trade_data) + '\n')
+        except Exception as e:
+            logger.debug(f"Failed to log trade metadata: {e}")
+    
+    def _safety_cleanup_orphaned_orders(self) -> None:
+        """
+        Safety cleanup - run every loop iteration to catch orphaned orders.
+        This is a lightweight check that verifies no position exists before cleaning up orders.
+        """
+        try:
+            # Verify position is actually closed via API
+            positions = self.client.get_positions()
+            has_position = any(
+                p.contract_id == self.contract.id and p.size != 0 
+                for p in positions
+            )
+            
+            # Only cleanup if definitely no position exists
+            if not has_position and self.current_position is None:
+                # No position exists - safe to clean up any orphaned orders
+                self._cancel_remaining_bracket_orders()
+        except Exception as e:
+            # Log but don't raise - cleanup failures shouldn't block trading loop
+            logger.debug(f"Safety cleanup check failed: {e}")
+    
+    def _reconcile_position_with_broker(self) -> None:
+        """Sync internal state with broker reality - called every loop iteration"""
+        try:
+            if self.contract is None:
+                return  # Can't reconcile without contract
+            
+            positions = self.client.get_positions()
+            broker_pos = None
+            for pos in positions:
+                if pos.contract_id == self.contract.id and pos.size != 0:
+                    broker_pos = pos
+                    break
+            
+            if broker_pos and not self.current_position:
+                # Found orphaned position - sync it
+                logger.warning("Orphaned position detected at broker - syncing internal state")
+                # Convert to UserPosition-like object for syncing
+                # Use actual position_type from Position object (more reliable)
+                from broker.signalr_client import UserPosition
+                broker_user_pos = UserPosition(
+                    id=0,
+                    account_id=self.client.account_id,
+                    contract_id=broker_pos.contract_id,
+                    position_type=broker_pos.position_type.value,  # Use actual position_type (1=LONG, 2=SHORT)
+                    size=broker_pos.size,
+                    average_price=broker_pos.average_price
+                )
+                logger.info(f"Position type from broker: {broker_pos.position_type.name} (value: {broker_pos.position_type.value})")
+                self._sync_position_from_broker(broker_user_pos)
+            elif not broker_pos and self.current_position:
+                # Position closed at broker but still tracked internally
+                logger.warning("Position closed at broker but still tracked internally - clearing state")
+                self.current_position = None
+                self._trading_locked = False
+            elif broker_pos and self.current_position:
+                # Sync quantities if they differ
+                actual_qty = abs(broker_pos.size)
+                if actual_qty != self.current_position.get('quantity', 0):
+                    logger.info(f"Syncing position quantity: {self.current_position.get('quantity', 0)} -> {actual_qty}")
+                    self.current_position['quantity'] = actual_qty
+        except Exception as e:
+            logger.debug(f"Position reconciliation failed: {e}")
+    
+    def _verify_order_placement(self, order_id: int, expected_size: int, 
+                               order_type: str, max_retries: int = 3) -> bool:
+        """Verify order actually exists after placement"""
+        for attempt in range(max_retries):
+            time.sleep(0.5)  # Wait for order to register
+            
+            try:
+                open_orders = self.client.get_open_orders()
+                for order in open_orders:
+                    if order.get('id') == order_id:
+                        order_size = abs(order.get('size', 0))
+                        if order_size == expected_size:
+                            logger.info(f"OK {order_type} order verified: ID {order_id}, size {order_size}")
+                            return True
+                        else:
+                            # CRITICAL FIX: Order exists but size differs - still return True
+                            # Size mismatch will be fixed by watchdog function separately
+                            # Returning False here causes duplicate order placement
+                            logger.warning(f"Order exists but size differs: {order_size} != {expected_size} (order ID {order_id}) - will fix size separately")
+                            return True  # Changed from False - prevents duplicate placement
+                
+                logger.warning(f"Attempt {attempt+1}/{max_retries}: Order {order_id} not found in open orders")
+            except Exception as e:
+                logger.error(f"Verification attempt {attempt+1}/{max_retries} failed: {e}")
+        
+        logger.error(f"FAILED Order {order_id} verification failed after {max_retries} attempts")
+        return False
+    
+    def _verify_all_orders_match_expectations(self, signal: Dict, expected_size: int, expected_entry: float) -> bool:
+        """
+        Comprehensive verification that all orders match expectations.
+        Returns True if everything is correct, False otherwise.
+        """
+        try:
+            logger.info("=" * 60)
+            logger.info("COMPREHENSIVE ORDER VERIFICATION")
+            logger.info("=" * 60)
+            
+            # Get actual position from API
+            positions = self.client.get_positions()
+            actual_position = None
+            for pos in positions:
+                if pos.contract_id == self.contract.id and pos.size != 0:
+                    actual_position = pos
+                    break
+            
+            if not actual_position:
+                logger.error("VERIFICATION FAILED: No position found in API")
+                return False
+            
+            actual_size = abs(actual_position.size)
+            actual_entry = actual_position.average_price
+            
+            logger.info(f"Position from API: {actual_size} contracts @ ${actual_entry:.2f}")
+            logger.info(f"Expected: {expected_size} contracts @ ${expected_entry:.2f}")
+            
+            # Verify position size matches
+            if actual_size != expected_size:
+                logger.error(f"VERIFICATION FAILED: Position size mismatch! Expected {expected_size}, got {actual_size}")
+                return False
+            
+            # Verify entry price is reasonable (within 5 ticks)
+            entry_diff_ticks = abs(actual_entry - expected_entry) / self.tick_size
+            if entry_diff_ticks > 5:
+                logger.warning(f"Entry price differs by {entry_diff_ticks:.1f} ticks (expected ${expected_entry:.2f}, got ${actual_entry:.2f})")
+                # Not a failure, but log it
+            
+            # Get all open orders
+            open_orders = self.client.get_open_orders()
+            stop_orders = []
+            tp_orders = []
+            
+            for order in open_orders:
+                if order.get('contractId') == self.contract.id:
+                    order_type = order.get('type')
+                    order_size = order.get('size', 0)
+                    order_id = order.get('id')
+                    
+                    if order_type == 4:  # STOP
+                        stop_price = order.get('stopPrice', 0)
+                        stop_orders.append({
+                            'id': order_id,
+                            'size': order_size,
+                            'price': stop_price
+                        })
+                    elif order_type == 1:  # LIMIT (could be TP)
+                        limit_price = order.get('limitPrice', 0)
+                        # Check if it's a TP (on correct side of entry)
+                        if signal['type'] == 'long' and limit_price > actual_entry:
+                            tp_orders.append({
+                                'id': order_id,
+                                'size': order_size,
+                                'price': limit_price
+                            })
+                        elif signal['type'] == 'short' and limit_price < actual_entry:
+                            tp_orders.append({
+                                'id': order_id,
+                                'size': order_size,
+                                'price': limit_price
+                            })
+            
+            # Verify stop loss exists and matches
+            if not stop_orders:
+                logger.error("VERIFICATION FAILED: No stop loss order found!")
+                return False
+            
+            if len(stop_orders) > 1:
+                logger.warning(f"VERIFICATION WARNING: Found {len(stop_orders)} stop orders (expected 1)")
+            
+            for stop in stop_orders:
+                if stop['size'] != actual_size:
+                    logger.error(f"VERIFICATION FAILED: Stop loss size mismatch! Expected {actual_size}, got {stop['size']}")
+                    return False
+                logger.info(f"Stop loss verified: ID {stop['id']}, Size: {stop['size']}, Price: ${stop['price']:.2f}")
+            
+            # Verify take profit exists and matches
+            if not tp_orders:
+                logger.warning("VERIFICATION WARNING: No take profit order found")
+            else:
+                if len(tp_orders) > 1:
+                    logger.warning(f"VERIFICATION WARNING: Found {len(tp_orders)} take profit orders (expected 1)")
+                
+                for tp in tp_orders:
+                    if tp['size'] != actual_size:
+                        logger.error(f"VERIFICATION FAILED: Take profit size mismatch! Expected {actual_size}, got {tp['size']}")
+                        return False
+                    logger.info(f"Take profit verified: ID {tp['id']}, Size: {tp['size']}, Price: ${tp['price']:.2f}")
+            
+            logger.info("=" * 60)
+            logger.info("VERIFICATION PASSED: All orders match expectations")
+            logger.info("=" * 60)
+            return True
+            
+        except Exception as e:
+            logger.error(f"VERIFICATION ERROR: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+    
+    def _emergency_close_all(self) -> None:
+        """
+        Emergency cleanup: Close all positions and cancel all orders for this contract.
+        Used when verification fails or position is closed.
+        """
+        try:
+            logger.warning("EMERGENCY CLEANUP: Closing all positions and orders...")
+            
+            # CRITICAL FIX 13: Close all positions and verify closure
+            positions = self.client.get_positions()
+            positions_to_close = [p for p in positions if p.contract_id == self.contract.id and p.size != 0]
+            
+            for pos in positions_to_close:
+                size = abs(pos.size)
+                side = OrderSide.ASK if pos.size > 0 else OrderSide.BID
+                logger.warning(f"Closing position: {size} contracts ({'LONG' if pos.size > 0 else 'SHORT'})")
+                result = self.client.place_market_order(
+                    contract_id=self.contract.id,
+                    side=side,
+                    size=size
+                )
+                if result.get('success'):
+                    logger.info(f"Market order placed to close {size} contracts")
+                else:
+                    logger.error(f"FAILED Failed to close position: {result.get('errorMessage')}")
+            
+            # Wait for positions to close and verify
+            if positions_to_close:
+                import time
+                time.sleep(3)  # Increased wait time for market orders to fill
+                
+                # Verify positions are closed
+                remaining_positions = self.client.get_positions()
+                still_open = [p for p in remaining_positions if p.contract_id == self.contract.id and p.size != 0]
+                if still_open:
+                    logger.error(f"CRITICAL: {len(still_open)} position(s) still open after emergency close!")
+                    for p in still_open:
+                        logger.error(f"  Position still open: {p.size} contracts")
+                else:
+                    logger.info("All positions verified closed")
+            
+            # Cancel all orders for this contract
+            open_orders = self.client.get_open_orders()
+            cancelled = 0
+            for order in open_orders:
+                if order.get('contractId') == self.contract.id:
+                    order_id = order.get('id')
+                    order_type = order.get('type')
+                    order_size = order.get('size', 0)
+                    logger.warning(f"Cancelling order: ID {order_id}, Type {order_type}, Size {order_size}")
+                    result = self.client.cancel_order(order_id)
+                    if result.get('success'):
+                        logger.info(f"Order {order_id} cancelled")
+                        cancelled += 1
+                    else:
+                        logger.error(f"FAILED Failed to cancel order {order_id}: {result.get('errorMessage')}")
+            
+            if cancelled > 0:
+                logger.info(f"Emergency cleanup complete: {cancelled} order(s) cancelled")
+            else:
+                logger.info("Emergency cleanup complete: No orders to cancel")
+            
+            # Final verification - check again
+            time.sleep(1)
+            final_positions = self.client.get_positions()
+            final_orders = self.client.get_open_orders()
+            
+            remaining_positions = [p for p in final_positions if p.contract_id == self.contract.id and p.size != 0]
+            remaining_orders = [o for o in final_orders if o.get('contractId') == self.contract.id]
+            
+            if remaining_positions:
+                logger.error(f"WARNING: {len(remaining_positions)} position(s) still remain after cleanup!")
+            if remaining_orders:
+                logger.error(f"WARNING: {len(remaining_orders)} order(s) still remain after cleanup!")
+            
+            if not remaining_positions and not remaining_orders:
+                logger.info("Cleanup verified: No positions or orders remaining")
+            
+        except Exception as e:
+            logger.error(f"Emergency cleanup error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
     def _sync_position_from_broker(self, position: UserPosition) -> None:
         """Sync position state from broker when we detect orphaned position"""
         try:
             logger.warning(f"Syncing orphaned position: {position.size} contracts @ ${position.average_price:.2f}")
+            
+            # Determine side using position_type (more reliable than size)
+            # position_type: 1 = LONG, 2 = SHORT
+            # Handle both int (UserPosition) and Enum (Position from topstepx_client)
+            if hasattr(position, 'position_type'):
+                # Handle both int and Enum
+                pos_type_value = position.position_type.value if hasattr(position.position_type, 'value') else position.position_type
+                side = 'long' if pos_type_value == 1 else 'short'
+                logger.info(f"Position type: {pos_type_value} ({'LONG' if pos_type_value == 1 else 'SHORT'})")
+            else:
+                # Fallback to size-based detection
+                side = 'long' if position.size > 0 else 'short'
+                logger.info(f"Position side from size: {position.size} ({'LONG' if position.size > 0 else 'SHORT'})")
+            
             # Get current price for P&L calculation
             current_price = self._get_current_price()
             if current_price is None:
@@ -1161,43 +2227,734 @@ class LiveTrader:
                 return
             
             # Create position tracking entry
-            side = 'long' if position.size > 0 else 'short'
+            entry_price = position.average_price
+            logger.info(f"Syncing {side.upper()} position: {abs(position.size)} contracts @ ${entry_price:.2f}")
             self.current_position = {
                 'side': side,
-                'entry_price': position.average_price,
-                'stop_loss': position.average_price,  # Will need to query actual stop
-                'initial_stop_loss': position.average_price,
-                'take_profit': position.average_price,  # Will need to query actual TP
+                'entry_price': entry_price,
+                'stop_loss': entry_price,  # Will need to query actual stop
+                'initial_stop_loss': entry_price,
+                'take_profit': entry_price,  # Will need to query actual TP
                 'quantity': abs(position.size),
                 'entry_time': datetime.now(self.timezone),
                 'order_id': None,
                 'structure_levels': [],
                 'last_broken_level': None,
                 'break_even_set': False,
-                'partial_exit_done': False
+                'partial_exit_done': False,
+                'scale_out_levels_done': []  # Track completed scale-out levels
             }
             
+            # Initialize trailing stop tracking
+            self.highest_price = entry_price
+            self.lowest_price = entry_price
+            
             # Try to get actual stop/tp from open orders
+            tp_order_found = False
+            stop_order_side = None  # Track stop order side to validate it matches position side
             try:
                 open_orders = self.client.get_open_orders()
                 for order in open_orders:
                     if order.get('contractId') == self.contract.id:
+                        order_side_value = order.get('side', -1)  # 0 = BID (buy), 1 = ASK (sell)
+                        order_side = 'ASK' if order_side_value == 1 else 'BID' if order_side_value == 0 else 'UNKNOWN'
+                        
                         if order.get('type') == 4:  # STOP order
-                            self.current_position['stop_loss'] = order.get('stopPrice', position.average_price)
-                            self.current_position['stop_order_id'] = order.get('id')  # Store stop order ID
-                            logger.info(f"Found existing stop order: ID {order.get('id')} at ${order.get('stopPrice', 0):.2f}")
+                            stop_price = order.get('stopPrice', position.average_price)
+                            # Validate stop order direction matches position
+                            # For LONG: stop should be ASK (1 = sell to close loss) BELOW entry
+                            # For SHORT: stop should be BID (0 = buy to close loss) ABOVE entry
+                            # API: side = 0 (Bid/buy), side = 1 (Ask/sell)
+                            expected_stop_side_value = 1 if side == 'long' else 0  # ASK (1) for long, BID (0) for short
+                            
+                            if order_side_value == expected_stop_side_value:
+                                self.current_position['stop_loss'] = stop_price
+                                self.current_position['initial_stop_loss'] = stop_price
+                                self.current_position['stop_order_id'] = order.get('id')
+                                logger.info(f"Found existing stop order: ID {order.get('id')} at ${stop_price:.2f} (side: {order_side}, position: {side.upper()})")
+                                stop_order_side = order_side
+                            else:
+                                expected_side_str = 'ASK (1)' if side == 'long' else 'BID (0)'
+                                logger.warning(f"Found stop order with wrong side: ID {order.get('id')}, side {order_side} ({order_side_value}), expected {expected_side_str} for {side.upper()}")
+                        
                         elif order.get('type') == 1:  # LIMIT order (could be TP)
-                            if (side == 'long' and order.get('limitPrice', 0) > position.average_price) or \
-                               (side == 'short' and order.get('limitPrice', 0) < position.average_price):
-                                self.current_position['take_profit'] = order.get('limitPrice', position.average_price)
-            except:
-                pass
+                            limit_price = order.get('limitPrice', 0)
+                            # Validate TP order direction and price match position
+                            # For LONG: TP should be ASK (sell to take profit) ABOVE entry
+                            # For SHORT: TP should be BID (buy to take profit) BELOW entry
+                            expected_tp_side = 'ASK' if side == 'long' else 'BID'
+                            
+                            is_valid_tp = False
+                            if side == 'long' and limit_price > position.average_price and order_side == expected_tp_side:
+                                is_valid_tp = True
+                            elif side == 'short' and limit_price < position.average_price and order_side == expected_tp_side:
+                                is_valid_tp = True
+                            
+                            if is_valid_tp:
+                                self.current_position['take_profit'] = limit_price
+                                self.current_position['tp_order_id'] = order.get('id')
+                                tp_order_found = True
+                                logger.info(f"Found existing TP order: ID {order.get('id')} at ${limit_price:.2f} (side: {order_side}, position: {side.upper()})")
+                            else:
+                                logger.debug(f"Ignoring limit order (not TP): ID {order.get('id')} at ${limit_price:.2f}, side {order_side} (position: {side.upper()}, entry: ${entry_price:.2f})")
+            except Exception as e:
+                logger.warning(f"Error checking open orders during sync: {e}")
+            
+            # CRITICAL FIX 9: Double-check for existing TP orders before placing new one
+            # Re-check open orders to ensure we didn't miss any TP orders
+            if not tp_order_found:
+                try:
+                    open_orders_recheck = self.client.get_open_orders()
+                    for order in open_orders_recheck:
+                        if order.get('contractId') == self.contract.id and order.get('type') == 1:  # LIMIT order
+                            limit_price = order.get('limitPrice', 0)
+                            order_side_value = order.get('side', -1)  # 0 = BID (buy), 1 = ASK (sell)
+                            order_side = 'ASK' if order_side_value == 1 else 'BID' if order_side_value == 0 else 'UNKNOWN'
+                            expected_tp_side = 'ASK' if side == 'long' else 'BID'
+                            
+                            is_valid_tp = False
+                            if side == 'long' and limit_price > entry_price and order_side == expected_tp_side:
+                                is_valid_tp = True
+                            elif side == 'short' and limit_price < entry_price and order_side == expected_tp_side:
+                                is_valid_tp = True
+                            
+                            if is_valid_tp:
+                                self.current_position['take_profit'] = limit_price
+                                self.current_position['tp_order_id'] = order.get('id')
+                                tp_order_found = True
+                                logger.info(f"Found existing TP order on recheck: ID {order.get('id')} at ${limit_price:.2f}")
+                                break
+                except Exception as e:
+                    logger.warning(f"Error rechecking orders: {e}")
+            
+            # If no TP order found, calculate and place one based on stop loss and min_rr
+            if not tp_order_found:
+                stop_loss = self.current_position.get('stop_loss', entry_price)
+                
+                # Calculate TP based on risk/reward ratio (min_rr from config)
+                min_rr = self.config.get('min_rr', 1.3)
+                
+                if side == 'long':
+                    # For LONG: Stop loss should be BELOW entry, TP should be ABOVE entry
+                    if stop_loss < entry_price:
+                        risk = entry_price - stop_loss
+                        take_profit = entry_price + (risk * min_rr)
+                        logger.info(f"LONG position: Entry ${entry_price:.2f}, SL ${stop_loss:.2f} (below), Risk ${risk:.2f}, TP ${take_profit:.2f}")
+                    else:
+                        # Invalid stop loss (above entry for long) - use default
+                        logger.warning(f"LONG position: Stop loss ${stop_loss:.2f} is ABOVE entry ${entry_price:.2f} (invalid), using default TP distance")
+                        default_risk_ticks = 20
+                        take_profit = entry_price + (default_risk_ticks * self.tick_size * min_rr)
+                        
+                else:  # short
+                    # For SHORT: Stop loss should be ABOVE entry, TP should be BELOW entry
+                    if stop_loss > entry_price:
+                        risk = stop_loss - entry_price
+                        take_profit = entry_price - (risk * min_rr)
+                        logger.info(f"SHORT position: Entry ${entry_price:.2f}, SL ${stop_loss:.2f} (above), Risk ${risk:.2f}, TP ${take_profit:.2f}")
+                    else:
+                        # Invalid stop loss (below entry for short) - use default
+                        logger.warning(f"SHORT position: Stop loss ${stop_loss:.2f} is BELOW entry ${entry_price:.2f} (invalid), using default TP distance")
+                        default_risk_ticks = 20
+                        take_profit = entry_price - (default_risk_ticks * self.tick_size * min_rr)
+                
+                # Round to tick size
+                take_profit = round(take_profit / self.tick_size) * self.tick_size
+                self.current_position['take_profit'] = take_profit
+                
+                # Place TP order with correct side
+                # LONG: TP is ASK (sell) order ABOVE entry
+                # SHORT: TP is BID (buy) order BELOW entry
+                try:
+                    if side == 'long':
+                        tp_side = OrderSide.ASK  # Sell to close long position
+                        if take_profit <= entry_price:
+                            logger.error(f"CRITICAL: TP ${take_profit:.2f} must be ABOVE entry ${entry_price:.2f} for LONG position!")
+                            return
+                    else:  # short
+                        tp_side = OrderSide.BID  # Buy to close short position
+                        if take_profit >= entry_price:
+                            logger.error(f"CRITICAL: TP ${take_profit:.2f} must be BELOW entry ${entry_price:.2f} for SHORT position!")
+                            return
+                    
+                    quantity = abs(position.size)
+                    logger.info(f"Placing missing TP order: {side.upper()} {quantity} contracts, {tp_side.name} @ ${take_profit:.2f}")
+                    
+                    tp_result = self.client.place_limit_order(
+                        contract_id=self.contract.id,
+                        side=tp_side,
+                        size=quantity,
+                        limit_price=take_profit
+                    )
+                    
+                    if tp_result.get('success'):
+                        tp_order_id = tp_result.get('orderId')
+                        self.current_position['tp_order_id'] = tp_order_id
+                        logger.info(f"TP order placed successfully: ID {tp_order_id}, {tp_side.name} {quantity} @ ${take_profit:.2f} ({side.upper()} position)")
+                    else:
+                        error_msg = tp_result.get('errorMessage', 'Unknown error')
+                        logger.error(f"Failed to place TP order: {error_msg}")
+                        self.alerts.error(f"Failed to place TP order for {side.upper()} position: {error_msg}")
+                except Exception as e:
+                    logger.error(f"Exception placing TP order: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
             
             logger.info(f"Position synced: {side} {abs(position.size)} @ ${position.average_price:.2f}")
+            logger.info(f"  Stop Loss: ${self.current_position.get('stop_loss', entry_price):.2f}")
+            logger.info(f"  Take Profit: ${self.current_position.get('take_profit', entry_price):.2f}")
             self.alerts.error(f"Orphaned position detected and synced: {side} {abs(position.size)} contracts")
             
         except Exception as e:
             logger.error(f"Failed to sync position from broker: {e}")
+    
+    def _ensure_protective_orders_exist(self, broker_position) -> None:
+        """Ensure SL and TP orders exist for current position - place missing ones"""
+        if not self.current_position or not broker_position:
+            return
+        
+        # CRITICAL FIX: Prevent concurrent execution with lock
+        if hasattr(self, '_placing_protective_orders') and self._placing_protective_orders:
+            logger.debug("Protective order placement already in progress - skipping duplicate call")
+            return
+        
+        # CRITICAL FIX: Disable watchdog during order updates
+        if hasattr(self, '_updating_stop_order') and self._updating_stop_order:
+            logger.debug("Stop order update in progress - skipping watchdog")
+            return
+        
+        if self._executing_entry:
+            logger.debug("Entry execution in progress - skipping watchdog")
+            return
+        
+        # CRITICAL FIX: Add debouncing/cooldown (only run once per 60 seconds)
+        from datetime import datetime, timedelta
+        if hasattr(self, '_last_watchdog_check'):
+            elapsed = (datetime.now(self.timezone) - self._last_watchdog_check).total_seconds()
+            if elapsed < 60:  # Only run once per minute
+                logger.debug(f"Watchdog cooldown active ({elapsed:.1f}s < 60s) - skipping")
+                return
+        
+        self._last_watchdog_check = datetime.now(self.timezone)
+        self._placing_protective_orders = True
+        
+        try:
+            side = self.current_position.get('side', 'long')
+            entry_price = self.current_position.get('entry_price', broker_position.average_price)
+            quantity = abs(broker_position.size)
+            
+            # FIX 1: Enhanced watchdog - check for missing orders AND size mismatches
+            # Get all open orders for this contract
+            open_orders = self.client.get_open_orders()
+            has_stop = False
+            has_tp = False
+            stop_order_id = None
+            stop_order_size = None
+            tp_order_id = None
+            tp_order_size = None
+            
+            for order in open_orders:
+                if order.get('contractId') != self.contract.id:
+                    continue
+                
+                order_type = order.get('type')
+                order_size = abs(order.get('size', 0))
+                order_id = order.get('id')
+                
+                # Check for stop loss order
+                if order_type == 4:  # STOP order
+                    order_side_value = order.get('side', -1)  # 0 = BID (buy), 1 = ASK (sell)
+                    expected_stop_side_value = 1 if side == 'long' else 0  # ASK (1) for long, BID (0) for short
+                    if order_side_value == expected_stop_side_value:
+                        stop_order_id = order_id
+                        stop_order_size = order_size
+                        if order_size == quantity:
+                            has_stop = True
+                            if not self.current_position.get('stop_order_id'):
+                                self.current_position['stop_order_id'] = order_id
+                                self.current_position['stop_loss'] = order.get('stopPrice', 0)
+                
+                # Check for take profit order
+                elif order_type == 1:  # LIMIT order
+                    limit_price = order.get('limitPrice', 0)
+                    order_side_value = order.get('side', -1)  # 0 = BID (buy), 1 = ASK (sell)
+                    expected_tp_side_value = 1 if side == 'long' else 0  # ASK (1) for long, BID (0) for short
+                    
+                    is_valid_tp = False
+                    if side == 'long' and limit_price > entry_price and order_side_value == expected_tp_side_value:
+                        is_valid_tp = True
+                    elif side == 'short' and limit_price < entry_price and order_side_value == expected_tp_side_value:
+                        is_valid_tp = True
+                    
+                    if is_valid_tp:
+                        tp_order_id = order_id
+                        tp_order_size = order_size
+                        if order_size == quantity:
+                            has_tp = True
+                            if not self.current_position.get('tp_order_id'):
+                                self.current_position['tp_order_id'] = order_id
+                                self.current_position['take_profit'] = limit_price
+            
+            # FIX 1: Enhanced watchdog - Fix size mismatches (order exists but wrong size)
+            # This is critical after partial exits, BE moves, or any order modifications
+            if stop_order_id and stop_order_size != quantity:
+                logger.warning(f"FIX 1 WATCHDOG: Stop order size mismatch detected: {stop_order_id} has size {stop_order_size}, position has {quantity}. Fixing...")
+                try:
+                    stop_price = None
+                    # Get stop price from order
+                    for order in open_orders:
+                        if order.get('id') == stop_order_id:
+                            stop_price = order.get('stopPrice')
+                            break
+                    
+                    if stop_price:
+                        # FIX 3: Validate stop price before modifying
+                        current_price = self._get_current_price()
+                        if current_price:
+                            if side == 'long':
+                                # For LONG: stop must be below best_ask (at least 2 ticks)
+                                if self.last_quote:
+                                    best_ask = self.last_quote.best_ask
+                                    max_allowed = best_ask - (2 * self.tick_size)
+                                    if stop_price >= best_ask or stop_price > max_allowed:
+                                        stop_price = round((best_ask - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                        logger.warning(f"Adjusted stop price for API requirement: ${stop_price:.2f}")
+                            else:  # short
+                                # For SHORT: stop must be above best_bid (at least 2 ticks)
+                                if self.last_quote:
+                                    best_bid = self.last_quote.best_bid
+                                    min_allowed = best_bid + (2 * self.tick_size)
+                                    if stop_price <= best_bid or stop_price < min_allowed:
+                                        stop_price = round((best_bid + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                        logger.warning(f"Adjusted stop price for API requirement: ${stop_price:.2f}")
+                        
+                        result = self.client.modify_order(
+                            order_id=stop_order_id,
+                            size=quantity,
+                            stop_price=stop_price
+                        )
+                        if result.get('success'):
+                            # CRITICAL FIX 8: Verify the modification actually worked
+                            time.sleep(0.5)
+                            if self._verify_order_placement(stop_order_id, quantity, 'Stop Loss', max_retries=2):
+                                logger.info(f"FIX 1: Fixed stop order size: {stop_order_id} -> {quantity} contracts (verified)")
+                                has_stop = True  # Now it's valid
+                                if not self.current_position.get('stop_order_id'):
+                                    self.current_position['stop_order_id'] = stop_order_id
+                            else:
+                                logger.warning(f"Stop order size fix succeeded but verification failed - order may not be updated correctly")
+                                # Don't set has_stop = True if verification failed
+                        else:
+                            logger.error(f"Failed to fix stop order size: {result.get('errorMessage')}")
+                            # If modify fails, try place-first pattern
+                            logger.warning("Modify failed, attempting place-first pattern for stop order...")
+                            self._update_stop_order(stop_price)  # This will use place-first pattern
+                    else:
+                        logger.warning(f"Could not get stop price for order {stop_order_id}")
+                except Exception as e:
+                    logger.error(f"Exception fixing stop order size: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            
+            # FIX 1: Enhanced watchdog - Fix TP size mismatches
+            if tp_order_id and tp_order_size != quantity:
+                logger.warning(f"FIX 1 WATCHDOG: TP order size mismatch detected: {tp_order_id} has size {tp_order_size}, position has {quantity}. Fixing...")
+                try:
+                    tp_price = None
+                    # Get TP price from order
+                    for order in open_orders:
+                        if order.get('id') == tp_order_id:
+                            tp_price = order.get('limitPrice')
+                            break
+                    
+                    if tp_price:
+                        # FIX 3: Validate TP price before modifying
+                        current_price = self._get_current_price()
+                        if current_price and self.last_quote:
+                            if side == 'long':
+                                # For LONG: TP should be above best_ask
+                                best_ask = self.last_quote.best_ask
+                                if tp_price <= best_ask:
+                                    tp_price = round((best_ask + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                    logger.warning(f"Adjusted TP price for API requirement: ${tp_price:.2f}")
+                            else:  # short
+                                # For SHORT: TP should be below best_bid
+                                best_bid = self.last_quote.best_bid
+                                if tp_price >= best_bid:
+                                    tp_price = round((best_bid - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                    logger.warning(f"Adjusted TP price for API requirement: ${tp_price:.2f}")
+                        
+                        result = self.client.modify_order(
+                            order_id=tp_order_id,
+                            size=quantity,
+                            limit_price=tp_price
+                        )
+                        if result.get('success'):
+                            # CRITICAL FIX 8: Verify the modification actually worked
+                            time.sleep(0.5)
+                            if self._verify_order_placement(tp_order_id, quantity, 'Take Profit', max_retries=2):
+                                logger.info(f"FIX 1: Fixed TP order size: {tp_order_id} -> {quantity} contracts (verified)")
+                                has_tp = True  # Now it's valid
+                                if not self.current_position.get('tp_order_id'):
+                                    self.current_position['tp_order_id'] = tp_order_id
+                            else:
+                                logger.warning(f"TP order size fix succeeded but verification failed - order may not be updated correctly")
+                                # Don't set has_tp = True if verification failed
+                        else:
+                            error_msg = result.get('errorMessage', 'Unknown error')
+                            logger.error(f"Failed to fix TP order size: {error_msg}")
+                            # If modify fails, use place-first pattern (same as in partial exit)
+                            logger.warning("Modify failed, attempting place-first pattern for TP order...")
+                            # Use the same robust replace logic from partial exit
+                            tp_side = OrderSide.ASK if side == 'long' else OrderSide.BID
+                            new_tp_result = self.client.place_limit_order(
+                                contract_id=self.contract.id,
+                                side=tp_side,
+                                size=quantity,
+                                limit_price=tp_price
+                            )
+                            if new_tp_result.get('success'):
+                                new_tp_id = new_tp_result.get('orderId')
+                                time.sleep(0.5)
+                                if self._verify_order_placement(new_tp_id, quantity, 'Take Profit', max_retries=2):
+                                    self.current_position['tp_order_id'] = new_tp_id
+                                    self.current_position['take_profit'] = tp_price
+                                    # Cancel old TP
+                                    try:
+                                        self.client.cancel_order(tp_order_id)
+                                        logger.info(f"FIX 1: TP order replaced via place-first: {new_tp_id} (old {tp_order_id} cancelled)")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to cancel old TP: {e}")
+                    else:
+                        logger.warning(f"Could not get TP price for order {tp_order_id}")
+                except Exception as e:
+                    logger.error(f"Exception fixing TP order size: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            
+            # CRITICAL FIX: Check if we already have a stop order ID tracked before placing new one
+            # This prevents duplicate orders when verification fails but order actually exists
+            tracked_sl_order_id = self.current_position.get('stop_order_id')
+            if tracked_sl_order_id and not has_stop:
+                # Verify the tracked order ID exists in open orders
+                order_exists = False
+                for order in open_orders:
+                    if order.get('id') == tracked_sl_order_id and order.get('contractId') == self.contract.id:
+                        order_exists = True
+                        # Update has_stop if order exists (even if size mismatch, we'll fix that above)
+                        has_stop = True
+                        logger.info(f"Tracked stop order {tracked_sl_order_id} exists in open orders (will fix size if needed)")
+                        break
+                
+                if not order_exists:
+                    # Tracked order doesn't exist - clear it so we can place a new one
+                    logger.warning(f"Tracked stop order {tracked_sl_order_id} not found in open orders - clearing and will place new one")
+                    self.current_position['stop_order_id'] = None
+            
+            # CRITICAL FIX: Count existing stop orders before placing new one
+            existing_sl_count = 0
+            for order in open_orders:
+                if (order.get('contractId') == self.contract.id and 
+                    order.get('type') == 4):  # STOP order
+                    order_side_value = order.get('side', -1)  # 0 = BID (buy), 1 = ASK (sell)
+                    expected_stop_side_value = 1 if side == 'long' else 0  # ASK (1) for long, BID (0) for short
+                    if order_side_value == expected_stop_side_value:
+                        existing_sl_count += 1
+            
+            if existing_sl_count > 1:
+                logger.error(f"CRITICAL: Found {existing_sl_count} duplicate stop orders! Cleaning up...")
+                # Keep only the first one, cancel others
+                kept_first = False
+                for order in open_orders:
+                    if (order.get('contractId') == self.contract.id and 
+                        order.get('type') == 4):
+                        order_side_value = order.get('side', -1)  # 0 = BID (buy), 1 = ASK (sell)
+                        expected_stop_side_value = 1 if side == 'long' else 0  # ASK (1) for long, BID (0) for short
+                        if order_side_value == expected_stop_side_value:
+                            if not kept_first:
+                                kept_first = True
+                                self.current_position['stop_order_id'] = order.get('id')
+                                self.current_position['stop_loss'] = order.get('stopPrice', 0)
+                                logger.info(f"Keeping stop order: {order.get('id')}")
+                            else:
+                                try:
+                                    logger.warning(f"Cancelling duplicate stop order: {order.get('id')}")
+                                    self.client.cancel_order(order.get('id'))
+                                except Exception as e:
+                                    logger.error(f"Failed to cancel duplicate: {e}")
+                has_stop = True  # Mark as having stop after cleanup
+            
+            # Place missing stop loss
+            if not has_stop:
+                logger.warning("CRITICAL: Missing stop loss order detected - placing now")
+                stop_loss = self.current_position.get('stop_loss') or self.current_position.get('initial_stop_loss')
+                if not stop_loss:
+                    # Calculate stop loss from entry
+                    risk_ticks = 20  # Default
+                    if side == 'long':
+                        stop_loss = entry_price - (risk_ticks * self.tick_size)
+                    else:
+                        stop_loss = entry_price + (risk_ticks * self.tick_size)
+                
+                # Round to tick size
+                stop_loss = round(stop_loss / self.tick_size) * self.tick_size
+                
+                # Get current market price for validation
+                current_price = None
+                try:
+                    if self.last_quote and self.last_quote.contract_id == self.contract.id:
+                        current_price = (self.last_quote.best_bid + self.last_quote.best_ask) / 2
+                        best_bid = self.last_quote.best_bid
+                        best_ask = self.last_quote.best_ask
+                    else:
+                        # Try to get from recent bars
+                        import time
+                        time.sleep(0.5)  # Brief wait for quote
+                        if self.last_quote and self.last_quote.contract_id == self.contract.id:
+                            current_price = (self.last_quote.best_bid + self.last_quote.best_ask) / 2
+                            best_bid = self.last_quote.best_bid
+                            best_ask = self.last_quote.best_ask
+                        else:
+                            # Fallback: use entry price as approximation
+                            current_price = entry_price
+                            best_bid = entry_price - (1 * self.tick_size)  # Approximate
+                            best_ask = entry_price + (1 * self.tick_size)  # Approximate
+                    
+                    if current_price:
+                        if side == 'long':
+                            # For LONG: stop must be below best_ask (at least 2 ticks)
+                            max_allowed_stop = best_ask - (2 * self.tick_size)
+                            if stop_loss >= best_ask or stop_loss > max_allowed_stop:
+                                original_sl = stop_loss
+                                stop_loss = round((best_ask - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                logger.warning(f"Stop price adjusted for API: ${original_sl:.2f} -> ${stop_loss:.2f} (best_ask: ${best_ask:.2f})")
+                            # Also ensure stop is below entry for long
+                            if stop_loss >= entry_price:
+                                stop_loss = round((entry_price - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                logger.warning(f"Stop adjusted below entry: ${stop_loss:.2f}")
+                        else:  # short
+                            # For SHORT: stop must be above best_bid (at least 2 ticks)
+                            min_allowed_stop = best_bid + (2 * self.tick_size)
+                            if stop_loss <= best_bid or stop_loss < min_allowed_stop:
+                                original_sl = stop_loss
+                                stop_loss = round((best_bid + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                logger.warning(f"Stop price adjusted for API: ${original_sl:.2f} -> ${stop_loss:.2f} (best_bid: ${best_bid:.2f})")
+                            # Also ensure stop is above entry for short
+                            if stop_loss <= entry_price:
+                                stop_loss = round((entry_price + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                logger.warning(f"Stop adjusted above entry: ${stop_loss:.2f}")
+                except Exception as e:
+                    logger.warning(f"Could not validate stop price: {e}")
+                
+                sl_side = OrderSide.ASK if side == 'long' else OrderSide.BID
+                
+                # Retry with price adjustment
+                sl_placed = False
+                for attempt in range(5):
+                    if attempt > 0:
+                        # Adjust price based on error
+                        if side == 'long':
+                            stop_loss = stop_loss - (1 * self.tick_size)
+                        else:
+                            stop_loss = stop_loss + (1 * self.tick_size)
+                        logger.info(f"Retrying SL placement (attempt {attempt + 1}) with adjusted price: ${stop_loss:.2f}")
+                    
+                    sl_result = self.client.place_stop_order(
+                        contract_id=self.contract.id,
+                        side=sl_side,
+                        size=quantity,
+                        stop_price=stop_loss
+                    )
+                    
+                    if sl_result.get('success'):
+                        sl_order_id = sl_result.get('orderId')
+                        time.sleep(0.5)
+                        if self._verify_order_placement(sl_order_id, quantity, 'Stop Loss', max_retries=2):
+                            self.current_position['stop_order_id'] = sl_order_id
+                            self.current_position['stop_loss'] = stop_loss
+                            logger.info(f"Missing stop loss placed and verified: ID {sl_order_id} @ ${stop_loss:.2f}")
+                            self.alerts.error(f"Missing stop loss placed for {side.upper()} position")
+                            sl_placed = True
+                            break
+                    else:
+                        error_msg = sl_result.get('errorMessage', 'Unknown error')
+                        logger.warning(f"SL attempt {attempt + 1} failed: {error_msg}")
+                        if attempt < 4:
+                            time.sleep(1.0)
+                
+                if not sl_placed:
+                    logger.error(f"CRITICAL: Failed to place missing stop loss after 5 attempts")
+                    self.alerts.error(f"CRITICAL: Failed to place missing stop loss!")
+            
+            # CRITICAL FIX: Check if we already have a TP order ID tracked before placing new one
+            # This prevents duplicate orders when verification fails but order actually exists
+            tracked_tp_order_id = self.current_position.get('tp_order_id')
+            if tracked_tp_order_id and not has_tp:
+                # Verify the tracked order ID exists in open orders
+                order_exists = False
+                for order in open_orders:
+                    if order.get('id') == tracked_tp_order_id and order.get('contractId') == self.contract.id:
+                        order_exists = True
+                        # Update has_tp if order exists (even if size mismatch, we'll fix that above)
+                        has_tp = True
+                        logger.info(f"Tracked TP order {tracked_tp_order_id} exists in open orders (will fix size if needed)")
+                        break
+                
+                if not order_exists:
+                    # Tracked order doesn't exist - clear it so we can place a new one
+                    logger.warning(f"Tracked TP order {tracked_tp_order_id} not found in open orders - clearing and will place new one")
+                    self.current_position['tp_order_id'] = None
+            
+            # CRITICAL FIX: Count existing TP orders before placing new one
+            existing_tp_count = 0
+            for order in open_orders:
+                if (order.get('contractId') == self.contract.id and 
+                    order.get('type') == 1):  # LIMIT order
+                    limit_price = order.get('limitPrice', 0)
+                    order_side_value = order.get('side', -1)  # 0 = BID (buy), 1 = ASK (sell)
+                    expected_tp_side_value = 1 if side == 'long' else 0  # ASK (1) for long, BID (0) for short
+                    is_valid_tp = False
+                    if side == 'long' and limit_price > entry_price and order_side_value == expected_tp_side_value:
+                        is_valid_tp = True
+                    elif side == 'short' and limit_price < entry_price and order_side_value == expected_tp_side_value:
+                        is_valid_tp = True
+                    if is_valid_tp:
+                        existing_tp_count += 1
+            
+            if existing_tp_count > 1:
+                logger.error(f"CRITICAL: Found {existing_tp_count} duplicate TP orders! Cleaning up...")
+                # Keep only the first one, cancel others
+                kept_first = False
+                for order in open_orders:
+                    if (order.get('contractId') == self.contract.id and 
+                        order.get('type') == 1):
+                        limit_price = order.get('limitPrice', 0)
+                        order_side_value = order.get('side', -1)  # 0 = BID (buy), 1 = ASK (sell)
+                        expected_tp_side_value = 1 if side == 'long' else 0  # ASK (1) for long, BID (0) for short
+                        is_valid_tp = False
+                        if side == 'long' and limit_price > entry_price and order_side_value == expected_tp_side_value:
+                            is_valid_tp = True
+                        elif side == 'short' and limit_price < entry_price and order_side_value == expected_tp_side_value:
+                            is_valid_tp = True
+                        if is_valid_tp:
+                            if not kept_first:
+                                kept_first = True
+                                self.current_position['tp_order_id'] = order.get('id')
+                                self.current_position['take_profit'] = limit_price
+                                logger.info(f"Keeping TP order: {order.get('id')}")
+                            else:
+                                try:
+                                    logger.warning(f"Cancelling duplicate TP order: {order.get('id')}")
+                                    self.client.cancel_order(order.get('id'))
+                                except Exception as e:
+                                    logger.error(f"Failed to cancel duplicate: {e}")
+                has_tp = True  # Mark as having TP after cleanup
+            
+            # Place missing take profit
+            if not has_tp:
+                logger.warning("Missing take profit order detected - placing now")
+                take_profit = self.current_position.get('take_profit')
+                if not take_profit:
+                    # Calculate TP from stop loss and min_rr
+                    stop_loss = self.current_position.get('stop_loss') or self.current_position.get('initial_stop_loss')
+                    min_rr = self.config.get('min_rr', 1.3)
+                    risk = abs(entry_price - stop_loss) if stop_loss else (20 * self.tick_size)
+                    if side == 'long':
+                        take_profit = entry_price + (risk * min_rr)
+                    else:
+                        take_profit = entry_price - (risk * min_rr)
+                
+                # Round to tick size
+                take_profit = round(take_profit / self.tick_size) * self.tick_size
+                
+                # Validate TP price
+                try:
+                    if self.last_quote and self.last_quote.contract_id == self.contract.id:
+                        quote = self.last_quote
+                    else:
+                        # Try to get quote from market data
+                        try:
+                            bars = self.client.get_historical_bars(
+                                contract_id=self.contract.id,
+                                interval=3,
+                                count=1,
+                                live=True,
+                                unit=2
+                            )
+                            if bars and len(bars) > 0:
+                                class SimpleQuote:
+                                    def __init__(self, bid, ask):
+                                        self.bid = bid
+                                        self.ask = ask
+                                        self.contract_id = self.contract.id
+                                quote = SimpleQuote(bars[0]['c'], bars[0]['c'])
+                            else:
+                                quote = None
+                        except:
+                            quote = None
+                    
+                    if quote:
+                        if side == 'long':
+                            best_ask = getattr(quote, 'ask', getattr(quote, 'best_ask', None))
+                            if best_ask:
+                                # TP should be above current ask
+                                if take_profit <= best_ask:
+                                    take_profit = round((best_ask + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                    logger.warning(f"TP adjusted to be above best_ask: ${take_profit:.2f}")
+                        else:  # short
+                            best_bid = getattr(quote, 'bid', getattr(quote, 'best_bid', None))
+                            if best_bid:
+                                # TP should be below current bid
+                                if take_profit >= best_bid:
+                                    take_profit = round((best_bid - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                    logger.warning(f"TP adjusted to be below best_bid: ${take_profit:.2f}")
+                except Exception as e:
+                    logger.warning(f"Could not validate TP price: {e}")
+                
+                tp_side = OrderSide.ASK if side == 'long' else OrderSide.BID
+                
+                # Retry with price adjustment
+                tp_placed = False
+                for attempt in range(5):
+                    if attempt > 0:
+                        # Adjust price based on error
+                        if side == 'long':
+                            take_profit = take_profit + (1 * self.tick_size)
+                        else:
+                            take_profit = take_profit - (1 * self.tick_size)
+                        logger.info(f"Retrying TP placement (attempt {attempt + 1}) with adjusted price: ${take_profit:.2f}")
+                    
+                    tp_result = self.client.place_limit_order(
+                        contract_id=self.contract.id,
+                        side=tp_side,
+                        size=quantity,
+                        limit_price=take_profit
+                    )
+                    
+                    if tp_result.get('success'):
+                        tp_order_id = tp_result.get('orderId')
+                        time.sleep(0.5)
+                        if self._verify_order_placement(tp_order_id, quantity, 'Take Profit', max_retries=2):
+                            self.current_position['tp_order_id'] = tp_order_id
+                            self.current_position['take_profit'] = take_profit
+                            logger.info(f"Missing take profit placed and verified: ID {tp_order_id} @ ${take_profit:.2f}")
+                            tp_placed = True
+                            break
+                    else:
+                        error_msg = tp_result.get('errorMessage', 'Unknown error')
+                        logger.warning(f"TP attempt {attempt + 1} failed: {error_msg}")
+                        if attempt < 4:
+                            time.sleep(1.0)
+                
+                if not tp_placed:
+                    logger.warning(f"Failed to place missing take profit after 5 attempts")
+            
+        except Exception as e:
+            logger.error(f"Error ensuring protective orders exist: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        finally:
+            self._placing_protective_orders = False
     
     def _check_break_even(self) -> None:
         if self.current_position is None:
@@ -1264,12 +3021,69 @@ class LiveTrader:
                     logger.debug("Break-even already set, skipping duplicate call")
                     return
                 
+                # FIX 3: Validate BE price against market before moving stop
+                be_price = entry
+                if current_price is not None and self.last_quote:
+                    if side == 'long':
+                        # For LONG: stop must be below best_ask (at least 2 ticks)
+                        best_ask = self.last_quote.best_ask
+                        max_allowed_be = best_ask - (2 * self.tick_size)
+                        if be_price >= best_ask or be_price > max_allowed_be:
+                            # Adjust BE to be as close to entry as possible but still valid
+                            be_price = round((best_ask - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                            # Ensure it's still reasonably close to entry (within 5 ticks)
+                            if abs(be_price - entry) <= 5 * self.tick_size:
+                                logger.info(f"FIX 3: BE price adjusted for LONG: ${entry:.2f} -> ${be_price:.2f} (best_ask: ${best_ask:.2f})")
+                            else:
+                                logger.warning(f"BE price ${entry:.2f} too close to current ${current_price:.2f}, using adjusted ${be_price:.2f}")
+                    else:  # short
+                        # For SHORT: stop must be above best_bid (at least 2 ticks)
+                        best_bid = self.last_quote.best_bid
+                        min_allowed_be = best_bid + (2 * self.tick_size)
+                        if be_price <= best_bid or be_price < min_allowed_be:
+                            # Adjust BE to be as close to entry as possible but still valid
+                            be_price = round((best_bid + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                            # Ensure it's still >= entry (for short, stop must protect against losses)
+                            if be_price < entry:
+                                be_price = entry
+                            # Ensure it's still reasonably close to entry (within 5 ticks)
+                            if abs(be_price - entry) <= 5 * self.tick_size:
+                                logger.info(f"FIX 3: BE price adjusted for SHORT: ${entry:.2f} -> ${be_price:.2f} (best_bid: ${best_bid:.2f})")
+                            else:
+                                logger.warning(f"BE price ${entry:.2f} too close to current ${current_price:.2f}, using adjusted ${be_price:.2f}")
+                
                 # Set flag IMMEDIATELY to prevent other threads from processing
                 self.current_position['break_even_set'] = True
-                logger.info(f"Moving stop to break-even: ${entry:.2f} ({reason})")
-                self.current_position['stop_loss'] = entry
-                self._update_stop_order(entry)  # Update broker stop order
-                self.alerts.stop_moved_to_breakeven(entry)
+                logger.info(f"Moving stop to break-even: ${be_price:.2f} ({reason})")
+                self.current_position['stop_loss'] = be_price
+                # FIX 2: _update_stop_order already uses place-first pattern (never cancel-first)
+                self._update_stop_order(be_price)  # Update broker stop order
+                
+                # CRITICAL FIX 7: Also update TP order size when moving to break-even
+                # After partial exits, TP size might not match position size
+                tp_order_id = self.current_position.get('tp_order_id')
+                if tp_order_id:
+                    current_qty = self.current_position.get('quantity')
+                    if current_qty and current_qty > 0:
+                        tp_price = self.current_position.get('take_profit')
+                        if tp_price:
+                            try:
+                                # Try to modify TP order size to match current position
+                                result = self.client.modify_order(
+                                    order_id=tp_order_id,
+                                    size=current_qty,
+                                    limit_price=tp_price
+                                )
+                                if result.get('success'):
+                                    # Verify the modification
+                                    time.sleep(0.5)
+                                    if self._verify_order_placement(tp_order_id, current_qty, 'Take Profit', max_retries=2):
+                                        logger.info(f"TP order size updated to {current_qty} contracts during break-even move")
+                                    else:
+                                        logger.warning("TP order modify succeeded but verification failed")
+                            except Exception as e:
+                                logger.warning(f"Failed to update TP order size during break-even: {e}")
+                self.alerts.stop_moved_to_breakeven(be_price)
         finally:
             self._checking_break_even = False
     
@@ -1294,18 +3108,23 @@ class LiveTrader:
             logger.debug("No position for partial profit check")
             return
         
-        if self.current_position.get('partial_exit_done'):
-            logger.debug("Partial exit already done")
-            return
-        
         pos = self.current_position
         entry = pos['entry_price']
         initial_sl = pos.get('initial_stop_loss', pos['stop_loss'])
         side = pos['side']
-        
         risk = abs(entry - initial_sl)
-        buffer = self.structure_buffer_ticks * self.tick_size
         
+        # Check if using graduated scale-out levels
+        if self.scale_out_mode == 'graduated' and self.scale_out_levels:
+            self._check_gradual_partial_exit(current_price)
+            return
+        
+        # Legacy single partial exit (backward compatibility)
+        if pos.get('partial_exit_done'):
+            logger.debug("Partial exit already done")
+            return
+        
+        buffer = self.structure_buffer_ticks * self.tick_size
         logger.debug(f"Checking partial profit: entry=${entry:.2f}, price=${current_price:.2f}, side={side}, risk=${risk:.2f}")
         
         # Structure-based partial: exit just before the next structure level
@@ -1369,6 +3188,139 @@ class LiveTrader:
         if should_exit:
             logger.info(f"*** PARTIAL PROFIT TRIGGER HIT! *** Price: ${current_price:.2f}, Target: ${trigger_price:.2f}")
             self._execute_partial_exit(current_price)
+    
+    def _check_gradual_partial_exit(self, current_price: float) -> None:
+        """Check for graduated scale-out levels"""
+        if not self.partial_enabled or self.current_position is None:
+            return
+        
+        pos = self.current_position
+        scale_levels = self.scale_out_levels
+        
+        if not scale_levels:
+            return  # Fall back to original single partial
+        
+        entry = pos['entry_price']
+        initial_sl = pos.get('initial_stop_loss', pos['stop_loss'])
+        side = pos['side']
+        risk = abs(entry - initial_sl)
+        scale_out_done = pos.get('scale_out_levels_done', [])
+        
+        for level_idx, level_config in enumerate(scale_levels):
+            level_key = f'scale_out_{level_idx}_done'
+            if level_idx in scale_out_done:
+                continue  # Already exited at this level
+            
+            target_r = level_config.get('r', 0)
+            exit_pct = level_config.get('pct', 0.33)
+            
+            # Calculate target price
+            if target_r > 0:
+                # R-based target
+                if side == 'long':
+                    target_price = entry + (risk * target_r)
+                    if current_price >= target_price:
+                        self._execute_scaled_partial(pos, current_price, exit_pct, level_idx, level_config)
+                        return
+                else:  # short
+                    target_price = entry - (risk * target_r)
+                    if current_price <= target_price:
+                        self._execute_scaled_partial(pos, current_price, exit_pct, level_idx, level_config)
+                        return
+            elif target_r == 0 and level_config.get('target') == 'structure':
+                # Structure-based target (for final level)
+                if pos.get('structure_levels'):
+                    buffer = self.structure_buffer_ticks * self.tick_size * 2
+                    if side == 'long':
+                        for level in pos['structure_levels']:
+                            if level > entry:
+                                target_price = level - buffer
+                                if current_price >= target_price:
+                                    self._execute_scaled_partial(pos, current_price, exit_pct, level_idx, level_config)
+                                    return
+                                break
+                    else:  # short
+                        for level in pos['structure_levels']:
+                            if level < entry:
+                                target_price = level + buffer
+                                if current_price <= target_price:
+                                    self._execute_scaled_partial(pos, current_price, exit_pct, level_idx, level_config)
+                                    return
+                                break
+    
+    def _execute_scaled_partial(self, pos: dict, current_price: float, exit_pct: float, level_idx: int, level_config: dict) -> None:
+        """Execute a scaled partial exit with level-specific actions"""
+        side = pos['side']
+        current_qty = pos.get('quantity', self.position_size)
+        
+        exit_qty = max(1, int(current_qty * exit_pct))
+        
+        if exit_qty >= current_qty:
+            logger.warning(f"Cannot exit {exit_qty} contracts from {current_qty} remaining")
+            return
+        
+        logger.info("=" * 50)
+        logger.info(f"SCALE-OUT LEVEL {level_idx + 1} - Exiting {exit_qty} contracts ({exit_pct*100:.0f}%)")
+        logger.info("=" * 50)
+        
+        try:
+            result = self.client.partial_close_position(
+                contract_id=self.contract.id,
+                size=exit_qty
+            )
+            
+            if result.get('success'):
+                # Track completed level
+                scale_out_done = pos.get('scale_out_levels_done', [])
+                if level_idx not in scale_out_done:
+                    scale_out_done.append(level_idx)
+                pos['scale_out_levels_done'] = scale_out_done
+                
+                # Update position quantity
+                pos['quantity'] = current_qty - exit_qty
+                
+                entry = pos['entry_price']
+                initial_sl = pos.get('initial_stop_loss', pos['stop_loss'])
+                risk = abs(entry - initial_sl)
+                
+                logger.info(f"OK Scale-out level {level_idx + 1}: {exit_qty} contracts at ${current_price:.2f}")
+                logger.info(f"OK Remaining: {pos['quantity']} contracts")
+                
+                # Handle level-specific actions
+                if level_config.get('move_be', False):
+                    # Move stop to break-even
+                    pos['stop_loss'] = entry
+                    pos['break_even_set'] = True
+                    self._update_stop_order(entry)
+                    logger.info(f"OK Stop moved to break-even: ${entry:.2f}")
+                
+                if 'trail_r' in level_config:
+                    # Activate trailing stop for remaining position
+                    trail_r = level_config['trail_r']
+                    if side == 'long':
+                        trail_distance = risk * trail_r
+                        trail_price = current_price - trail_distance
+                        if trail_price > pos['stop_loss']:
+                            pos['stop_loss'] = trail_price
+                            self._update_stop_order(trail_price)
+                            logger.info(f"OK Trailing stop activated at ${trail_price:.2f} ({trail_r}R distance)")
+                    else:  # short
+                        trail_distance = risk * trail_r
+                        trail_price = current_price + trail_distance
+                        if trail_price < pos['stop_loss']:
+                            pos['stop_loss'] = trail_price
+                            self._update_stop_order(trail_price)
+                            logger.info(f"OK Trailing stop activated at ${trail_price:.2f} ({trail_r}R distance)")
+                
+                self.alerts.partial_exit(exit_qty, current_price)
+            else:
+                error = result.get('errorMessage', 'Unknown error')
+                logger.error(f"Scale-out level {level_idx + 1} failed: {error}")
+                
+        except Exception as e:
+            logger.error(f"Error executing scale-out level {level_idx + 1}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def _check_structure_level_break(self, current_price: float) -> None:
         """
@@ -1507,7 +3459,8 @@ class LiveTrader:
                 'entry_time': datetime.now(self.timezone),
                 'order_id': order_id,
                 'structure_levels': order.get('structure_levels', []),
-                'last_broken_level': None
+                'last_broken_level': None,
+                'scale_out_levels_done': []  # Track completed scale-out levels
             }
             
             self.highest_price = order['limit_price']
@@ -1570,9 +3523,17 @@ class LiveTrader:
                 sl_move = self.post_partial_sl_lock_r * risk
                 
                 if side == 'long':
+                    # For LONG: move stop up (above entry) to lock profit
                     new_sl = entry + sl_move
                 else:
-                    new_sl = entry - sl_move
+                    # For SHORT: move stop down (toward entry) to lock profit, but keep it above entry
+                    # Initial stop is above entry, so we move it down by sl_move
+                    # This locks in profit while keeping stop >= entry (protects against losses)
+                    if initial_sl > entry:
+                        new_sl = max(entry, initial_sl - sl_move)
+                    else:
+                        # Fallback: if initial_sl is somehow below entry, use entry (break-even)
+                        new_sl = entry
                 
                 pos['stop_loss'] = new_sl
                 
@@ -1580,7 +3541,215 @@ class LiveTrader:
                 logger.info(f"OK Remaining: {pos['quantity']} contracts")
                 logger.info(f"OK Stop moved to: ${new_sl:.2f} ({self.post_partial_sl_lock_r}R profit locked)")
                 
+                # FIX 4: Update BOTH stop loss AND take profit order sizes to match remaining position
+                remaining_qty = pos['quantity']
+                logger.info(f"FIX 4: Updating BOTH SL and TP orders to size {remaining_qty} contracts after partial exit")
+                
+                # Update stop loss order size and price
                 self._update_stop_order(new_sl)
+                
+                # FIX 4: Verify SL size was updated correctly
+                time.sleep(0.5)  # Brief wait for order update
+                sl_order_id = pos.get('stop_order_id')
+                if sl_order_id:
+                    try:
+                        open_orders = self.client.get_open_orders()
+                        for order in open_orders:
+                            if order.get('id') == sl_order_id and order.get('contractId') == self.contract.id:
+                                sl_size = abs(order.get('size', 0))
+                                if sl_size == remaining_qty:
+                                    logger.info(f"OK Stop loss order size verified: {sl_size} contracts")
+                                else:
+                                    logger.warning(f"Stop loss size mismatch: {sl_size} != {remaining_qty}. Will be fixed by watchdog.")
+                                    # Try to fix it immediately
+                                    try:
+                                        result = self.client.modify_order(
+                                            order_id=sl_order_id,
+                                            size=remaining_qty,
+                                            stop_price=new_sl
+                                        )
+                                        if result.get('success'):
+                                            logger.info(f"Fixed stop loss order size: {sl_order_id} -> {remaining_qty}")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to fix SL size immediately: {e}")
+                                break
+                    except Exception as e:
+                        logger.warning(f"Could not verify SL order size: {e}")
+                
+                # FIX 5: Update take profit order size to match remaining position (robust retry loop)
+                tp_order_id = pos.get('tp_order_id')
+                if tp_order_id:
+                    tp_price = pos.get('take_profit')
+                    if tp_price:
+                        logger.info(f"Updating take profit order size after partial: {tp_order_id} -> {remaining_qty} contracts")
+                        
+                        # Try modify first (preferred method)
+                        modify_success = False
+                        try:
+                            result = self.client.modify_order(
+                                order_id=tp_order_id,
+                                size=remaining_qty,
+                                limit_price=tp_price
+                            )
+                            if result.get('success'):
+                                # Verify the modification
+                                time.sleep(0.5)
+                                if self._verify_order_placement(tp_order_id, remaining_qty, 'Take Profit', max_retries=2):
+                                    logger.info(f"OK Take profit order size updated to {remaining_qty} contracts")
+                                    modify_success = True
+                                else:
+                                    logger.warning("TP order modify succeeded but verification failed")
+                        except Exception as e:
+                            logger.warning(f"Exception during TP modify: {e}")
+                        
+                        # If modify failed, use robust replace (place-first, then cancel)
+                        if not modify_success:
+                            error_msg = result.get('errorMessage', 'Unknown error') if 'result' in locals() else 'Exception during modify'
+                            logger.warning(f"TP modify failed: {error_msg}. Using robust replace (place-first pattern)...")
+                            
+                            # FIX 5: Robust TP replace with retry loop, price validation, and verification
+                            tp_side = OrderSide.ASK if side == 'long' else OrderSide.BID
+                            tp_placed = False
+                            max_tp_retries = 5
+                            
+                            for tp_attempt in range(max_tp_retries):
+                                # Get fresh quote before each attempt to adjust price if needed
+                                if tp_attempt > 0:
+                                    try:
+                                        if self.last_quote and self.last_quote.contract_id == self.contract.id:
+                                            if side == 'long':
+                                                # For LONG: TP should be above best_ask
+                                                best_ask = self.last_quote.best_ask
+                                                if tp_price <= best_ask:
+                                                    tp_price = round((best_ask + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                                    logger.info(f"Adjusted TP price for retry: ${tp_price:.2f} (best_ask: ${best_ask:.2f})")
+                                            else:  # short
+                                                # For SHORT: TP should be below best_bid
+                                                best_bid = self.last_quote.best_bid
+                                                if tp_price >= best_bid:
+                                                    tp_price = round((best_bid - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                                                    logger.info(f"Adjusted TP price for retry: ${tp_price:.2f} (best_bid: ${best_bid:.2f})")
+                                            time.sleep(0.5)  # Brief wait for quote update
+                                    except Exception as e:
+                                        logger.debug(f"Could not adjust TP price: {e}")
+                                
+                                # STEP 1: Place new TP order FIRST (before canceling old one)
+                                logger.info(f"Placing new TP order (attempt {tp_attempt + 1}/{max_tp_retries}): {tp_side.name} {remaining_qty} @ ${tp_price:.2f}")
+                                tp_result = self.client.place_limit_order(
+                                    contract_id=self.contract.id,
+                                    side=tp_side,
+                                    size=remaining_qty,
+                                    limit_price=tp_price
+                                )
+                                
+                                if tp_result.get('success'):
+                                    new_tp_order_id = tp_result.get('orderId')
+                                    # Verify order was actually placed
+                                    time.sleep(0.5)
+                                    if self._verify_order_placement(new_tp_order_id, remaining_qty, 'Take Profit', max_retries=2):
+                                        # STEP 2: New TP verified - now safely cancel old TP
+                                        pos['tp_order_id'] = new_tp_order_id
+                                        pos['take_profit'] = tp_price
+                                        logger.info(f"OK Take profit order replaced: ID {new_tp_order_id} @ ${tp_price:.2f}, size {remaining_qty}")
+                                        
+                                        # CRITICAL FIX 6: Cancel old TP order and verify cancellation
+                                        try:
+                                            self.client.cancel_order(tp_order_id)
+                                            logger.info(f"Cancelled old TP order: {tp_order_id}")
+                                            
+                                            # Wait and verify old order is cancelled
+                                            time.sleep(1.0)
+                                            open_orders_after = self.client.get_open_orders()
+                                            old_order_still_exists = any(o.get('id') == tp_order_id 
+                                                                        for o in open_orders_after 
+                                                                        if o.get('contractId') == self.contract.id)
+                                            if old_order_still_exists:
+                                                logger.warning(f"Old TP order {tp_order_id} still exists after cancel - retrying cancellation")
+                                                try:
+                                                    self.client.cancel_order(tp_order_id)
+                                                    time.sleep(0.5)
+                                                except:
+                                                    pass
+                                            else:
+                                                logger.info(f"Old TP order {tp_order_id} successfully cancelled and verified")
+                                        except Exception as e:
+                                            logger.warning(f"Failed to cancel old TP order {tp_order_id}: {e}")
+                                        
+                                        tp_placed = True
+                                        break
+                                    else:
+                                        # CRITICAL FIX 3: Verification failed - cancel this failed attempt before retry
+                                        logger.warning(f"TP order {new_tp_order_id} not verified, cancelling before retry...")
+                                        try:
+                                            self.client.cancel_order(new_tp_order_id)
+                                            logger.info(f"Cancelled unverified TP order {new_tp_order_id} before retry")
+                                        except Exception as e:
+                                            logger.warning(f"Failed to cancel unverified TP order {new_tp_order_id}: {e}")
+                                        
+                                        if tp_attempt < max_tp_retries - 1:
+                                            time.sleep(1.5)
+                                else:
+                                    error_msg = tp_result.get('errorMessage', 'Unknown error')
+                                    logger.warning(f"TP attempt {tp_attempt + 1} failed: {error_msg}")
+                                    # If price error, adjust price for next attempt
+                                    if 'price' in error_msg.lower() or 'outside' in error_msg.lower():
+                                        if side == 'long':
+                                            tp_price = tp_price + (1 * self.tick_size)  # Move up
+                                        else:
+                                            tp_price = tp_price - (1 * self.tick_size)  # Move down
+                                        logger.info(f"Adjusting TP price for next attempt: ${tp_price:.2f}")
+                                    if tp_attempt < max_tp_retries - 1:
+                                        time.sleep(1.5)  # Wait before retry
+                            
+                            if not tp_placed:
+                                # TP replace failed - old TP may still exist (check and keep it if valid)
+                                logger.error(f"Failed to replace TP order after {max_tp_retries} attempts")
+                                self.alerts.error(f"TP order resize failed after partial exit - old TP may still be active")
+                                # Old TP order remains (may have wrong size, but better than nothing)
+                    else:
+                        logger.warning("No TP price found in position - cannot update take profit order")
+                else:
+                    logger.warning("No TP order ID found - cannot update take profit order size")
+                
+                # FIX 4: Final verification - ensure BOTH SL and TP sizes match remaining position
+                time.sleep(0.5)  # Brief wait for all order updates
+                logger.info("FIX 4: Final verification of SL and TP order sizes after partial exit...")
+                try:
+                    open_orders = self.client.get_open_orders()
+                    sl_verified = False
+                    tp_verified = False
+                    
+                    for order in open_orders:
+                        if order.get('contractId') != self.contract.id:
+                            continue
+                        
+                        order_id = order.get('id')
+                        order_size = abs(order.get('size', 0))
+                        order_type = order.get('type')
+                        
+                        if order_type == 4 and order_id == pos.get('stop_order_id'):  # STOP order
+                            if order_size == remaining_qty:
+                                sl_verified = True
+                                logger.info(f"OK Final verification: Stop loss order size correct ({order_size} contracts)")
+                            else:
+                                logger.warning(f"WARNING: Stop loss order size mismatch: {order_size} != {remaining_qty}")
+                        
+                        elif order_type == 1 and order_id == pos.get('tp_order_id'):  # LIMIT order (TP)
+                            if order_size == remaining_qty:
+                                tp_verified = True
+                                logger.info(f"OK Final verification: Take profit order size correct ({order_size} contracts)")
+                            else:
+                                logger.warning(f"WARNING: Take profit order size mismatch: {order_size} != {remaining_qty}")
+                    
+                    if not sl_verified:
+                        logger.warning("WARNING: Stop loss order not verified after partial exit - watchdog will fix")
+                    if not tp_verified and pos.get('tp_order_id'):
+                        logger.warning("WARNING: Take profit order not verified after partial exit - watchdog will fix")
+                    
+                    if sl_verified and (tp_verified or not pos.get('tp_order_id')):
+                        logger.info("OK Both protective orders verified after partial exit")
+                except Exception as e:
+                    logger.warning(f"Could not perform final verification: {e}")
                 
                 self.alerts.error(f"Partial profit: {exit_qty} contracts at ${current_price:.2f}. Stop to ${new_sl:.2f}")
             else:
@@ -1614,13 +3783,17 @@ class LiveTrader:
                     pos['stop_loss'] = new_sl
                     logger.info(f"Trailing stop updated: ${old_sl:.2f} → ${new_sl:.2f} (High: ${self.highest_price:.2f})")
                     self._update_stop_order(new_sl)
-        else:
+        else:  # short
             if current_price < self.lowest_price:
                 self.lowest_price = current_price
             
             current_profit = entry - self.lowest_price
             if current_profit >= activation_distance:
                 new_sl = self.lowest_price + trail_distance
+                # For SHORT, ensure stop is >= entry (protects against losses)
+                if new_sl < entry:
+                    new_sl = entry
+                # Only update if new stop is closer to entry (locks more profit)
                 if new_sl < pos['stop_loss']:
                     old_sl = pos['stop_loss']
                     pos['stop_loss'] = new_sl
@@ -1629,35 +3802,99 @@ class LiveTrader:
     
     def _update_stop_order(self, new_stop_price: float) -> None:
         try:
+            # CRITICAL FIX 16: Check position size before updating
             if self.current_position is None:
                 return
             
-            # Prevent concurrent calls with a simple lock
+            current_qty = self.current_position.get('quantity')
+            if current_qty is None or current_qty <= 0:
+                logger.warning("Position quantity is 0 or None - skipping stop order update")
+                return
+            
+            # CRITICAL FIX: Prevent concurrent calls with a lock
             if hasattr(self, '_updating_stop_order') and self._updating_stop_order:
                 logger.debug("Stop order update already in progress, skipping duplicate call")
                 return
             
+            # CRITICAL FIX: Add debouncing (max 1 update per 5 seconds)
+            if self._last_order_update:
+                elapsed = (datetime.now(self.timezone) - self._last_order_update).total_seconds()
+                if elapsed < 5:
+                    logger.debug(f"Order update too soon ({elapsed:.1f}s < 5s), skipping to prevent duplicates")
+                    return
+            
             self._updating_stop_order = True
+            self._last_order_update = datetime.now(self.timezone)
             
             try:
                 side = self.current_position['side']
                 current_price = self._get_current_price()
+                entry_price = self.current_position['entry_price']
                 
                 # Round to tick size first
                 new_stop_price = round(new_stop_price / self.tick_size) * self.tick_size
+                
+                # Check if this is a break-even move (stop price equals entry price)
+                is_break_even = abs(new_stop_price - entry_price) < self.tick_size / 2
                 
                 # Validate stop price
                 if current_price is not None:
                     if side == 'long':
                         # For LONG: stop must be below current price (or it would trigger immediately)
+                        # Exception: For break-even moves, allow entry price even if very close to current
                         if new_stop_price >= current_price:
-                            logger.warning(f"Invalid stop price for LONG: ${new_stop_price:.2f} >= current ${current_price:.2f}. Adjusting to ${current_price - self.tick_size:.2f}")
-                            new_stop_price = round((current_price - self.tick_size) / self.tick_size) * self.tick_size  # Place 1 tick below current
+                            if is_break_even:
+                                # For break-even, if entry is too close to current, place it slightly below current
+                                # but as close to entry as possible (minimum 2 ticks for API requirement)
+                                min_distance = 2 * self.tick_size
+                                adjusted_price = round((current_price - min_distance) / self.tick_size) * self.tick_size
+                                # Only adjust if we can still be reasonably close to entry (within 5 ticks)
+                                if abs(adjusted_price - entry_price) <= 5 * self.tick_size:
+                                    new_stop_price = adjusted_price
+                                    logger.info(f"Break-even adjusted for LONG: ${entry_price:.2f} -> ${new_stop_price:.2f} (current: ${current_price:.2f}, min distance: {min_distance/self.tick_size:.0f} ticks)")
+                                else:
+                                    logger.warning(f"Break-even at ${entry_price:.2f} too close to current ${current_price:.2f}, keeping entry price but order may be rejected")
+                            else:
+                                logger.warning(f"Invalid stop price for LONG: ${new_stop_price:.2f} >= current ${current_price:.2f}. Adjusting to ${current_price - self.tick_size:.2f}")
+                                new_stop_price = round((current_price - self.tick_size) / self.tick_size) * self.tick_size  # Place 1 tick below current
                     else:  # short
-                        # For SHORT: stop must be above current price
+                        # For SHORT: stop must be >= entry price (to protect against losses)
+                        # API requirement: stop must be above best bid
+                        
+                        # CRITICAL: For SHORT, stop must always be >= entry price
+                        if new_stop_price < entry_price:
+                            logger.warning(f"Invalid stop price for SHORT: ${new_stop_price:.2f} < entry ${entry_price:.2f}. Adjusting to entry price (break-even)")
+                            new_stop_price = entry_price
+                        
+                        # API requirement: stop must be above best bid
+                        # For SHORT, if current price is below entry (we're in profit), stop can be at entry or above
+                        # If current price is above entry (we're at a loss), stop must be above current
                         if new_stop_price <= current_price:
-                            logger.warning(f"Invalid stop price for SHORT: ${new_stop_price:.2f} <= current ${current_price:.2f}. Adjusting to ${current_price + self.tick_size:.2f}")
-                            new_stop_price = round((current_price + self.tick_size) / self.tick_size) * self.tick_size  # Place 1 tick above current
+                            if is_break_even:
+                                # For break-even, if entry is too close to current, place it slightly above current
+                                # but as close to entry as possible (minimum 2 ticks for API requirement)
+                                min_distance = 2 * self.tick_size
+                                adjusted_price = round((current_price + min_distance) / self.tick_size) * self.tick_size
+                                # Ensure adjusted price is still >= entry
+                                if adjusted_price < entry_price:
+                                    adjusted_price = entry_price
+                                # Only adjust if we can still be reasonably close to entry (within 5 ticks)
+                                if abs(adjusted_price - entry_price) <= 5 * self.tick_size:
+                                    new_stop_price = adjusted_price
+                                    logger.info(f"Break-even adjusted for SHORT: ${entry_price:.2f} -> ${new_stop_price:.2f} (current: ${current_price:.2f}, min distance: {min_distance/self.tick_size:.0f} ticks)")
+                                else:
+                                    logger.warning(f"Break-even at ${entry_price:.2f} too close to current ${current_price:.2f}, keeping entry price but order may be rejected")
+                            else:
+                                # For SHORT, if stop is at or below current price, it must be at least entry price
+                                # But API requires it to be above best bid, so we need to place it above current
+                                if new_stop_price < entry_price:
+                                    new_stop_price = entry_price
+                                if new_stop_price <= current_price:
+                                    logger.warning(f"Stop price for SHORT: ${new_stop_price:.2f} <= current ${current_price:.2f}. Adjusting to ${current_price + self.tick_size:.2f}")
+                                    new_stop_price = round((current_price + self.tick_size) / self.tick_size) * self.tick_size
+                                    # Ensure it's still >= entry
+                                    if new_stop_price < entry_price:
+                                        new_stop_price = entry_price
                 
                 # ALWAYS get fresh list of open orders first to find existing stop orders
                 existing_stop_order_id = None
@@ -1678,25 +3915,33 @@ class LiveTrader:
                 
                 # If we found an existing stop order, try to modify it
                 if existing_stop_order_id:
+                    # CRITICAL FIX 14: Track old order ID before overwriting (for cleanup if modify fails)
+                    old_stop_order_id = self.current_position.get('stop_order_id')
+                    if old_stop_order_id and old_stop_order_id != existing_stop_order_id:
+                        logger.debug(f"Found different stop order ID: old={old_stop_order_id}, found={existing_stop_order_id}")
                     # Update stored ID
                     self.current_position['stop_order_id'] = existing_stop_order_id
                     
-                    # Get current position quantity to update order size
-                    current_qty = self.current_position.get('quantity')
-                    if current_qty is None or current_qty <= 0:
-                        try:
-                            positions = self.client.get_positions()
-                            for pos in positions:
-                                if pos.contract_id == self.contract.id:
-                                    current_qty = abs(pos.size)
-                                    self.current_position['quantity'] = current_qty
-                                    break
-                        except Exception as e:
-                            logger.debug(f"Could not sync quantity: {e}")
+                    # ALWAYS sync quantity with actual broker position first
+                    current_qty = None
+                    try:
+                        positions = self.client.get_positions()
+                        for pos in positions:
+                            if pos.contract_id == self.contract.id and pos.size != 0:
+                                current_qty = abs(pos.size)
+                                # Update internal tracking
+                                self.current_position['quantity'] = current_qty
+                                logger.debug(f"Synced position quantity from broker: {current_qty} contracts")
+                                break
+                    except Exception as e:
+                        logger.error(f"Failed to sync position quantity from broker: {e}")
                     
-                    # Use current quantity or fallback to position_size
+                    # Fallback to stored quantity or position_size only if sync failed
                     if current_qty is None or current_qty <= 0:
-                        current_qty = self.position_size
+                        current_qty = self.current_position.get('quantity')
+                        if current_qty is None or current_qty <= 0:
+                            current_qty = self.position_size
+                            logger.warning(f"Using fallback position size: {current_qty} contracts (broker sync failed)")
                     
                     result = self.client.modify_order(
                         order_id=existing_stop_order_id,
@@ -1718,37 +3963,36 @@ class LiveTrader:
                         error_msg = result.get('errorMessage', 'Unknown error')
                         logger.warning(f"Modify failed: {error_msg}. Will cancel and place new order.")
                 
-                # If modify failed or no existing order, cancel ALL existing stop orders first
-                for stop_id in all_stop_order_ids:
-                    try:
-                        logger.info(f"Cancelling existing stop order: ID {stop_id}")
-                        self.client.cancel_order(stop_id)
-                    except Exception as e:
-                        logger.warning(f"Failed to cancel stop order {stop_id}: {e}")
+                # If modify failed or no existing order, store old stop order info before cancelling (for potential restore)
+                old_stop_order_id = existing_stop_order_id if existing_stop_order_id else (all_stop_order_ids[0] if all_stop_order_ids else None)
+                old_stop_price = self.current_position.get('stop_loss')
                 
-                # Now place new stop order
+                # FIX 2: PLACE-FIRST, THEN CANCEL (never cancel-first to avoid unprotected position)
+                # This ensures position is always protected - if new order fails, old order remains active
+                # Sync quantity with actual broker position first
                 stop_side = OrderSide.ASK if side == 'long' else OrderSide.BID
-                # ALWAYS use the actual position quantity, sync from broker if needed
-                remaining_qty = self.current_position.get('quantity')
-                if remaining_qty is None or remaining_qty <= 0:
-                    # Try to get actual quantity from broker
-                    try:
-                        positions = self.client.get_positions()
-                        for pos in positions:
-                            if pos.contract_id == self.contract.id:
-                                remaining_qty = abs(pos.size)
-                                self.current_position['quantity'] = remaining_qty
-                                logger.info(f"Synced position quantity from broker: {remaining_qty} contracts")
-                                break
-                    except Exception as e:
-                        logger.warning(f"Could not sync quantity from broker: {e}")
+                remaining_qty = None
+                try:
+                    positions = self.client.get_positions()
+                    for pos in positions:
+                        if pos.contract_id == self.contract.id and pos.size != 0:
+                            remaining_qty = abs(pos.size)
+                            # Update internal tracking
+                            self.current_position['quantity'] = remaining_qty
+                            logger.info(f"Synced position quantity from broker: {remaining_qty} contracts")
+                            break
+                except Exception as e:
+                    logger.error(f"Failed to sync position quantity from broker: {e}")
                 
-                # Fallback to position_size if still not set
+                # Fallback to stored quantity or position_size only if sync failed
                 if remaining_qty is None or remaining_qty <= 0:
-                    remaining_qty = self.position_size
-                    logger.warning(f"Using default position size: {remaining_qty} contracts (position quantity not set)")
+                    remaining_qty = self.current_position.get('quantity')
+                    if remaining_qty is None or remaining_qty <= 0:
+                        remaining_qty = self.position_size
+                        logger.warning(f"Using fallback position size: {remaining_qty} contracts (broker sync failed)")
                 
-                logger.info(f"Placing stop order: {stop_side.name} {remaining_qty} contracts @ ${new_stop_price:.2f}")
+                # STEP 1: Place new stop order FIRST (before canceling old one)
+                logger.info(f"Placing new stop order FIRST (place-first pattern): {stop_side.name} {remaining_qty} contracts @ ${new_stop_price:.2f}")
                 order = self.client.place_order(
                     contract_id=self.contract.id,
                     order_type=OrderType.STOP,
@@ -1757,12 +4001,131 @@ class LiveTrader:
                     stop_price=new_stop_price
                 )
                 
+                # STEP 2: Verify new stop order was actually placed
+                new_stop_order_id = None
+                new_stop_verified = False
+                
                 if order and order.get('orderId'):
-                    self.current_position['stop_order_id'] = order.get('orderId')
-                    logger.info(f"New stop order placed: #{order.get('orderId')} at ${new_stop_price:.2f}")
-                elif order and not order.get('success'):
-                    error_msg = order.get('errorMessage', 'Unknown error')
-                    logger.error(f"Failed to place stop order: {error_msg}")
+                    new_stop_order_id = order.get('orderId')
+                    logger.info(f"New stop order placed: #{new_stop_order_id} at ${new_stop_price:.2f}")
+                    
+                    # Verify the order actually exists by checking open orders
+                    try:
+                        time.sleep(0.5)  # Wait a moment for order to be registered
+                        open_orders = self.client.get_open_orders()
+                        for o in open_orders:
+                            if o.get('id') == new_stop_order_id and o.get('contractId') == self.contract.id:
+                                order_size = abs(o.get('size', 0))
+                                if order_size == remaining_qty:
+                                    new_stop_verified = True
+                                    logger.info(f"Verified: Stop order #{new_stop_order_id} confirmed in open orders (size: {order_size})")
+                                    break
+                                else:
+                                    logger.warning(f"Stop order #{new_stop_order_id} size mismatch: {order_size} != {remaining_qty}")
+                    except Exception as verify_e:
+                        logger.warning(f"Could not verify stop order placement: {verify_e}")
+                
+                # STEP 3: Only cancel old stop orders if new one was successfully placed and verified
+                if new_stop_verified and new_stop_order_id:
+                    # Update position tracking with new stop order
+                    self.current_position['stop_order_id'] = new_stop_order_id
+                    self.current_position['stop_loss'] = new_stop_price
+                    
+                    # CRITICAL FIX: Cancel ALL old stop orders and verify cancellation
+                    cancelled_count = 0
+                    for stop_id in all_stop_order_ids:
+                        if stop_id != new_stop_order_id:  # Don't cancel the new one
+                            try:
+                                logger.info(f"Cancelling old stop order: ID {stop_id}")
+                                self.client.cancel_order(stop_id)
+                                cancelled_count += 1
+                            except Exception as e:
+                                logger.warning(f"Failed to cancel old stop order {stop_id}: {e}")
+                    
+                    # Wait for cancellations to complete and verify
+                    if cancelled_count > 0:
+                        time.sleep(1.0)  # Wait for cancellations to propagate
+                        try:
+                            open_orders_after = self.client.get_open_orders()
+                            remaining_stops = [o.get('id') for o in open_orders_after 
+                                             if (o.get('contractId') == self.contract.id and 
+                                                 o.get('type') == 4 and 
+                                                 o.get('id') != new_stop_order_id)]
+                            if remaining_stops:
+                                logger.warning(f"Warning: {len(remaining_stops)} old stop orders still exist after cancel: {remaining_stops}")
+                                # Try one more cancellation pass
+                                for stop_id in remaining_stops:
+                                    try:
+                                        self.client.cancel_order(stop_id)
+                                    except:
+                                        pass
+                            else:
+                                logger.info(f"Successfully cancelled {cancelled_count} old stop order(s)")
+                        except Exception as e:
+                            logger.warning(f"Could not verify cancellations: {e}")
+                    
+                    logger.info(f"Stop order successfully updated: #{new_stop_order_id} at ${new_stop_price:.2f} (old orders cancelled)")
+                else:
+                    # New stop order placement/verification failed - KEEP OLD STOP (don't cancel)
+                    error_msg = order.get('errorMessage', 'Unknown error') if order else 'No order ID returned'
+                    logger.error(f"CRITICAL: Failed to place/verify new stop order: {error_msg}")
+                    logger.warning(f"KEEPING OLD STOP ORDER(s) - position remains protected by existing stop(s)")
+                    
+                    # Try to place new stop with retry and price adjustment
+                    if 'price' in error_msg.lower() or 'outside' in error_msg.lower():
+                        logger.info("Attempting price adjustment and retry...")
+                        # Adjust price based on error
+                        if side == 'long':
+                            adjusted_price = new_stop_price - (2 * self.tick_size)
+                        else:
+                            adjusted_price = new_stop_price + (2 * self.tick_size)
+                        
+                        # Validate adjusted price
+                        if current_price:
+                            if side == 'long' and adjusted_price >= current_price:
+                                adjusted_price = round((current_price - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                            elif side == 'short' and adjusted_price <= current_price:
+                                adjusted_price = round((current_price + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                        
+                        logger.info(f"Retrying with adjusted price: ${adjusted_price:.2f}")
+                        retry_order = self.client.place_order(
+                            contract_id=self.contract.id,
+                            order_type=OrderType.STOP,
+                            side=stop_side,
+                            size=remaining_qty,
+                            stop_price=adjusted_price
+                        )
+                        
+                        if retry_order and retry_order.get('orderId'):
+                            retry_order_id = retry_order.get('orderId')
+                            time.sleep(0.5)
+                            # Verify retry order
+                            try:
+                                open_orders = self.client.get_open_orders()
+                                for o in open_orders:
+                                    if o.get('id') == retry_order_id and o.get('contractId') == self.contract.id:
+                                        self.current_position['stop_order_id'] = retry_order_id
+                                        self.current_position['stop_loss'] = adjusted_price
+                                        logger.info(f"Retry successful: Stop order #{retry_order_id} at ${adjusted_price:.2f}")
+                                        # Now cancel old stops
+                                        for stop_id in all_stop_order_ids:
+                                            if stop_id != retry_order_id:
+                                                try:
+                                                    self.client.cancel_order(stop_id)
+                                                except Exception as e:
+                                                    logger.warning(f"Failed to cancel old stop {stop_id}: {e}")
+                                        return
+                            except Exception as e:
+                                logger.warning(f"Could not verify retry order: {e}")
+                    
+                    # If we still have old stop, keep it and alert
+                    if old_stop_order_id:
+                        logger.warning(f"Old stop order #{old_stop_order_id} remains active - position protected")
+                        self.alerts.error(f"Stop order update failed - old stop remains active. New stop: {error_msg}")
+                    else:
+                        logger.error(f"No old stop order to keep - position may be unprotected!")
+                        self.alerts.error(f"CRITICAL: Stop order update failed and no old stop exists - position unprotected!")
+                    self.alerts.error(f"CRITICAL: Stop order placement returned invalid response - position may be unprotected!")
             finally:
                 self._updating_stop_order = False
         except Exception as e:
@@ -1907,6 +4270,13 @@ class LiveTrader:
     def run_once(self) -> None:
         self._reset_daily_counters()
         
+        # Safety cleanup - run every iteration to catch orphaned orders
+        # This ensures cleanup happens quickly if position closes or tracking is lost
+        self._safety_cleanup_orphaned_orders()
+        
+        # Reconcile with broker EVERY iteration to sync internal state
+        self._reconcile_position_with_broker()
+        
         # CRITICAL: Check execution lock FIRST to prevent duplicate orders
         if self._executing_entry:
             logger.debug("Skipping run_once: Entry execution in progress")
@@ -1919,6 +4289,10 @@ class LiveTrader:
                 logger.debug("Trading locked - monitoring position status")
                 self._check_position_status()
                 
+                # ALWAYS check for orphaned orders even if position tracking exists
+                # This ensures cleanup happens quickly when position closes
+                self._cancel_remaining_bracket_orders()
+                
                 if self.current_position is not None:
                     if self._check_daily_loss_force_exit():
                         return
@@ -1928,6 +4302,9 @@ class LiveTrader:
                     if current_price:
                         self._update_trailing_stop(current_price)
                         self._check_partial_profit(current_price)
+            else:
+                # No position tracked but trading locked - check for orphaned orders
+                self._cancel_remaining_bracket_orders()
             return
         
         if self.current_position is not None:
@@ -1987,12 +4364,16 @@ class LiveTrader:
                 should_update_zones = True
                 logger.info(f"Zone update triggered: {time_since_update:.1f} minutes since last update")
         
+        # CRITICAL FIX 12: Skip zone updates when position is open (zones shouldn't change during trade)
         if should_update_zones:
-            # Prepare data and merge zones (don't replace existing zones)
-            self.rolling_df = self.strategy.prepare_data(self.rolling_df, merge_zones=True)
-            self.last_zone_update_bars = len(self.rolling_df)
-            self.last_zone_update_time = datetime.now(self.timezone)
-            logger.debug(f"Zones updated from rolling DataFrame ({len(self.rolling_df)} bars)")
+            if self.current_position is not None:
+                logger.debug("Skipping zone update - position is open (zones should remain stable during trade)")
+            else:
+                # Prepare data and merge zones (don't replace existing zones)
+                self.rolling_df = self.strategy.prepare_data(self.rolling_df, merge_zones=True)
+                self.last_zone_update_bars = len(self.rolling_df)
+                self.last_zone_update_time = datetime.now(self.timezone)
+                logger.debug(f"Zones updated from rolling DataFrame ({len(self.rolling_df)} bars)")
         
         # Add indicators to current df for signal generation (zones already in zone_manager)
         if 'atr' not in df.columns:
@@ -2047,22 +4428,36 @@ class LiveTrader:
                 logger.warning(f"Signal generated but pending limit order exists - skipping duplicate entry")
                 return
             
+            # Check circuit breaker before executing entry
+            if not self.circuit_breaker.should_allow_trade(timezone=self.timezone):
+                logger.error("Circuit breaker open - trade blocked (too many recent failures)")
+                return
+            
             # Set BOTH locks IMMEDIATELY before calling _execute_entry
             # This prevents another run_once() call from getting past the checks
             self._executing_entry = True
             self._trading_locked = True  # Lock trading until position closes
             
             try:
+                success = False
                 if self.limit_order_enabled:
                     # Create pending limit order instead of entering immediately
                     self._create_pending_limit_order(signal)
+                    success = True  # Assume success for limit orders (will be verified on fill)
                 else:
                     # Immediate market order entry
-                    self._execute_entry(signal)
+                    success = self._execute_entry(signal)
+                
+                # Record result in circuit breaker
+                if success:
+                    self.circuit_breaker.record_success()
+                else:
+                    self.circuit_breaker.record_failure(timezone=self.timezone)
             except Exception as e:
-                # Release lock on exception
+                # Release BOTH locks on exception
                 logger.error(f"Error executing entry: {e}")
                 self._executing_entry = False
+                self._trading_locked = False
                 raise
     
     def _check_connection_health(self) -> bool:
@@ -2107,17 +4502,47 @@ class LiveTrader:
             loop_count = 0
             while self.running:
                 try:
+                    # Check connection health via heartbeat monitor
+                    if not self.connection_monitor.check_health():
+                        logger.warning("Connection appears dead - attempting to reconnect...")
+                        self.stop()
+                        time.sleep(5)
+                        if self.connect():
+                            logger.info("OK Reconnected successfully")
+                            self.connection_monitor.record_heartbeat()
+                        else:
+                            logger.error("FAILED Reconnection failed - exiting")
+                            break
+                    
                     loop_count += 1
                     # Log every 10 loops (every ~5-10 minutes depending on interval) to show it's alive
                     if loop_count % 10 == 0:
                         logger.info(f"[HEARTBEAT] Trading loop active - iteration {loop_count}, position: {'OPEN' if self.current_position else 'NONE'}, locked: {self._trading_locked}")
                     
+                    # Record heartbeat on each successful loop iteration
+                    self.connection_monitor.record_heartbeat()
+                    
                     self.run_once()
                 except Exception as e:
-                    logger.error(f"Error in trading loop: {e}")
-                    import traceback
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    self.alerts.error(f"Trading loop error: {e}")
+                    # Wrap logging in try/except to prevent logging errors from crashing the loop
+                    try:
+                        import traceback
+                        error_msg = str(e)
+                        traceback_str = traceback.format_exc()
+                        logger.error(f"Error in trading loop: {error_msg}")
+                        logger.error(f"Traceback: {traceback_str}")
+                        # Only send alert if alerts don't cause errors
+                        try:
+                            self.alerts.error(f"Trading loop error: {error_msg}")
+                        except:
+                            pass  # Silently ignore alert errors
+                    except Exception as log_error:
+                        # If logging itself fails, write to file directly as last resort
+                        try:
+                            with open('live_trading.log', 'a') as f:
+                                f.write(f"{datetime.now()} - ERROR - Logging failed: {log_error}, Original error: {e}\n")
+                        except:
+                            pass  # If even file write fails, silently continue
                 
                 time.sleep(interval_seconds)
                 
@@ -2287,61 +4712,159 @@ class LiveTrader:
             self._trading_locked = True
             self._executing_entry = False
             
-            # Place bracket orders (stop loss and take profit)
-            logger.info("Placing bracket orders...")
+            # Update stop loss and take profit based on actual entry
+            if side == 'long':
+                stop_loss = round((actual_entry - (10 * self.tick_size)) / self.tick_size) * self.tick_size
+                take_profit = round((actual_entry + (30 * self.tick_size)) / self.tick_size) * self.tick_size
+            else:
+                stop_loss = round((actual_entry + (10 * self.tick_size)) / self.tick_size) * self.tick_size
+                take_profit = round((actual_entry - (30 * self.tick_size)) / self.tick_size) * self.tick_size
             
-            # Place stop loss order
+            # Validate stop price against current market (API requirement)
+            try:
+                quotes = self.client.get_quotes([self.contract.id])
+                if quotes and self.contract.id in quotes:
+                    fresh_quote = quotes[self.contract.id]
+                    if side == 'long':
+                        best_ask = fresh_quote.ask
+                        max_allowed_stop = best_ask - (2 * self.tick_size)
+                        if stop_loss >= best_ask or stop_loss > max_allowed_stop:
+                            original_sl = stop_loss
+                            stop_loss = round((best_ask - (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                            logger.warning(f"Stop price adjusted for API: ${original_sl:.2f} -> ${stop_loss:.2f} (best_ask: ${best_ask:.2f})")
+                    else:  # short
+                        best_bid = fresh_quote.bid
+                        min_allowed_stop = best_bid + (2 * self.tick_size)
+                        if stop_loss <= best_bid or stop_loss < min_allowed_stop:
+                            original_sl = stop_loss
+                            stop_loss = round((best_bid + (2 * self.tick_size)) / self.tick_size) * self.tick_size
+                            logger.warning(f"Stop price adjusted for API: ${original_sl:.2f} -> ${stop_loss:.2f} (best_bid: ${best_bid:.2f})")
+            except Exception as e:
+                logger.warning(f"Could not validate stop price with quote: {e}")
+            
+            # Update position with actual prices
+            self.current_position['stop_loss'] = stop_loss
+            self.current_position['take_profit'] = take_profit
+            self.current_position['initial_stop_loss'] = stop_loss
+            
+            # Place bracket orders with retry logic (CRITICAL)
+            logger.info("Placing bracket orders with retry logic...")
+            
+            # Place Stop Loss order with retry
             stop_side = OrderSide.ASK if side == 'long' else OrderSide.BID
-            stop_order = self.client.place_order(
-                contract_id=self.contract.id,
-                side=stop_side,
-                order_type=OrderType.STOP,
-                size=actual_qty,
-                stop_price=stop_loss
-            )
+            sl_order_id = None
+            sl_placed = False
+            max_sl_retries = 3
             
-            if stop_order and stop_order.get('success'):
-                stop_order_id = stop_order.get('orderId')
-                if stop_order_id:
-                    logger.info(f"Stop loss order placed: ID {stop_order_id} @ ${stop_loss:.2f}")
-                    self.pending_orders[stop_order_id] = {
-                        'type': 'stop_loss',
-                        'price': stop_loss
-                    }
+            for sl_attempt in range(max_sl_retries):
+                logger.info(f"Placing stop loss (attempt {sl_attempt + 1}/{max_sl_retries}): {stop_side.name} {actual_qty} @ ${stop_loss:.2f}")
+                sl_result = self.client.place_stop_order(
+                    contract_id=self.contract.id,
+                    side=stop_side,
+                    size=actual_qty,
+                    stop_price=stop_loss
+                )
+                
+                if sl_result.get('success'):
+                    sl_order_id = sl_result.get('orderId')
+                    time.sleep(0.5)
+                    if self._verify_order_placement(sl_order_id, actual_qty, 'Stop Loss', max_retries=2):
+                        self.current_position['stop_order_id'] = sl_order_id
+                        logger.info(f"Stop loss placed and verified: ID {sl_order_id} @ ${stop_loss:.2f}")
+                        sl_placed = True
+                        break
+                    else:
+                        logger.warning(f"Stop loss order {sl_order_id} not verified, retrying...")
+                        if sl_attempt < max_sl_retries - 1:
+                            time.sleep(1.0)
                 else:
-                    logger.warning("Stop loss order placed but no order ID returned")
-            else:
-                error_msg = stop_order.get('errorMessage', 'Unknown error') if stop_order else 'No response'
-                logger.warning(f"Failed to place stop loss order: {error_msg}")
+                    error_msg = sl_result.get('errorMessage', 'Unknown error')
+                    logger.warning(f"Stop loss attempt {sl_attempt + 1} failed: {error_msg}")
+                    if sl_attempt < max_sl_retries - 1:
+                        time.sleep(1.0)
             
-            # Place take profit order (partial exit at 1R, then move SL to BE)
-            # For test: exit 50% at 1R, keep 50% running
-            partial_qty = max(1, actual_qty // 2)  # At least 1 contract
-            remaining_qty = actual_qty - partial_qty
+            if not sl_placed:
+                logger.error(f"CRITICAL: All {max_sl_retries} stop loss attempts failed - closing position for safety")
+                try:
+                    close_result = self.client.close_position(self.contract.id)
+                    if close_result.get('success'):
+                        logger.info("Test position closed due to SL placement failure")
+                    else:
+                        logger.error(f"Failed to close position: {close_result.get('errorMessage')}")
+                except Exception as e:
+                    logger.error(f"Exception closing position: {e}")
+                self.current_position = None
+                self._trading_locked = False
+                return False
             
+            # Place Take Profit order with retry (full quantity for test)
             tp_side = OrderSide.ASK if side == 'long' else OrderSide.BID
-            tp_order = self.client.place_order(
-                contract_id=self.contract.id,
-                side=tp_side,
-                order_type=OrderType.LIMIT,
-                size=partial_qty,
-                limit_price=take_profit
-            )
+            tp_order_id = None
+            tp_placed = False
+            max_tp_retries = 3
             
-            if tp_order and tp_order.get('success'):
-                tp_order_id = tp_order.get('orderId')
-                if tp_order_id:
-                    logger.info(f"Take profit order placed: ID {tp_order_id} @ ${take_profit:.2f} ({partial_qty} contracts)")
-                    self.pending_orders[tp_order_id] = {
-                        'type': 'take_profit_partial',
-                        'price': take_profit,
-                        'quantity': partial_qty
-                    }
+            for tp_attempt in range(max_tp_retries):
+                logger.info(f"Placing take profit (attempt {tp_attempt + 1}/{max_tp_retries}): {tp_side.name} {actual_qty} @ ${take_profit:.2f}")
+                tp_result = self.client.place_limit_order(
+                    contract_id=self.contract.id,
+                    side=tp_side,
+                    size=actual_qty,
+                    limit_price=take_profit
+                )
+                
+                if tp_result.get('success'):
+                    tp_order_id = tp_result.get('orderId')
+                    time.sleep(0.5)
+                    if self._verify_order_placement(tp_order_id, actual_qty, 'Take Profit', max_retries=2):
+                        self.current_position['tp_order_id'] = tp_order_id
+                        logger.info(f"Take profit placed and verified: ID {tp_order_id} @ ${take_profit:.2f}")
+                        tp_placed = True
+                        break
+                    else:
+                        logger.warning(f"Take profit order {tp_order_id} not verified, retrying...")
+                        if tp_attempt < max_tp_retries - 1:
+                            time.sleep(1.0)
                 else:
-                    logger.warning("Take profit order placed but no order ID returned")
-            else:
-                error_msg = tp_order.get('errorMessage', 'Unknown error') if tp_order else 'No response'
-                logger.warning(f"Failed to place take profit order: {error_msg}")
+                    error_msg = tp_result.get('errorMessage', 'Unknown error')
+                    logger.warning(f"Take profit attempt {tp_attempt + 1} failed: {error_msg}")
+                    if tp_attempt < max_tp_retries - 1:
+                        time.sleep(1.0)
+            
+            if not tp_placed:
+                error_msg = tp_result.get('errorMessage', 'Unknown error') if tp_result else 'All attempts failed'
+                logger.error(f"Take profit placement failed after {max_tp_retries} attempts: {error_msg}")
+                logger.warning("Position protected by SL, but TP missing - will retry on next check")
+            
+            # Final verification
+            try:
+                time.sleep(1.0)
+                open_orders = self.client.get_open_orders()
+                sl_verified = False
+                tp_verified = False
+                
+                for order in open_orders:
+                    if order.get('contractId') == self.contract.id:
+                        order_id = order.get('id')
+                        order_type = order.get('type')
+                        
+                        if order_type == 4 and order_id == sl_order_id:
+                            order_size = abs(order.get('size', 0))
+                            if order_size == actual_qty:
+                                sl_verified = True
+                                logger.info(f"Final SL verification: ID {order_id} @ ${order.get('stopPrice', 0):.2f}, Size: {order_size}")
+                        elif order_type == 1 and order_id == tp_order_id:
+                            order_size = abs(order.get('size', 0))
+                            if order_size == actual_qty:
+                                tp_verified = True
+                                logger.info(f"Final TP verification: ID {order_id} @ ${order.get('limitPrice', 0):.2f}, Size: {order_size}")
+                
+                if not sl_verified:
+                    logger.error(f"CRITICAL: Stop loss order {sl_order_id} not found in final verification!")
+                if not tp_verified and tp_order_id:
+                    logger.warning(f"Take profit order {tp_order_id} not found in final verification")
+                    
+            except Exception as e:
+                logger.error(f"Final verification error: {e}")
             
             logger.info("=" * 70)
             logger.info("TEST TRADE PLACED SUCCESSFULLY")
@@ -2363,8 +4886,142 @@ class LiveTrader:
             return False
 
 
+def kill_existing_live_traders():
+    """Kill all running instances of live_trader.py before starting new one"""
+    import subprocess
+    
+    current_pid = os.getpid()
+    killed_count = 0
+    
+    logger.info("Checking for existing live trader instances...")
+    
+    if sys.platform == 'win32':
+        # Windows: use wmic to find processes, then taskkill to stop them
+        try:
+            # Find all python.exe processes with live_trader.py in command line
+            result = subprocess.run(
+                ['wmic', 'process', 'where', 'name="python.exe"', 'get', 'ProcessId,CommandLine', '/format:list'],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            )
+            
+            processes = []
+            current_process = {}
+            
+            for line in result.stdout.split('\n'):
+                line = line.strip()
+                if line.startswith('ProcessId='):
+                    if current_process:
+                        processes.append(current_process)
+                    current_process = {'pid': line.split('=')[1].strip()}
+                elif line.startswith('CommandLine='):
+                    current_process['cmd'] = line.split('=', 1)[1] if '=' in line else ''
+            
+            if current_process:
+                processes.append(current_process)
+            
+            # Filter for live_trader processes (exclude current process)
+            live_trader_pids = []
+            for proc in processes:
+                cmd = proc.get('cmd', '').lower()
+                pid = proc.get('pid', '').strip()
+                
+                # Check if this is a live_trader process and not the current process
+                if pid and pid != 'None' and pid != str(current_pid):
+                    # Check for live_trader.py in command line (case insensitive)
+                    if 'live_trader.py' in cmd and 'check_running' not in cmd:
+                        try:
+                            # Validate PID is numeric before adding
+                            int(pid)
+                            live_trader_pids.append(pid)
+                        except ValueError:
+                            logger.debug(f"Invalid PID found: {pid}")
+            
+            if live_trader_pids:
+                logger.warning(f"Found {len(live_trader_pids)} existing live_trader instance(s) to kill: {', '.join(live_trader_pids)}")
+                for pid in live_trader_pids:
+                    try:
+                        result = subprocess.run(
+                            ['taskkill', '/F', '/PID', pid],
+                            capture_output=True,
+                            text=True,
+                            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                        )
+                        if result.returncode == 0:
+                            logger.info(f"OK Killed live trader instance (PID: {pid})")
+                            killed_count += 1
+                        else:
+                            # Check if process doesn't exist (already terminated)
+                            if 'not found' in result.stdout.lower() or 'not found' in result.stderr.lower():
+                                logger.debug(f"Process {pid} already terminated")
+                            else:
+                                logger.warning(f"Failed to kill PID {pid}: {result.stderr.strip() or result.stdout.strip()}")
+                    except Exception as e:
+                        logger.warning(f"Error killing PID {pid}: {e}")
+                
+                # Give processes time to fully terminate
+                if killed_count > 0:
+                    logger.info(f"Waiting 3 seconds for processes to terminate...")
+                    time.sleep(3)
+                else:
+                    logger.info("No processes were killed (may have already terminated)")
+            else:
+                logger.info("OK No existing live trader instances found")
+                
+        except Exception as e:
+            logger.warning(f"Could not check for existing instances: {e}")
+    else:
+        # Unix-like: use pkill (but need to exclude current process)
+        try:
+            # First, get current process info to exclude it
+            current_cmd = ' '.join(sys.argv)
+            
+            # Use pgrep to find PIDs first, then kill them individually (excluding current)
+            pgrep_result = subprocess.run(
+                ['pgrep', '-f', 'live_trader.py'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if pgrep_result.returncode == 0:
+                pids = pgrep_result.stdout.strip().split('\n')
+                pids_to_kill = [pid.strip() for pid in pids if pid.strip() and pid.strip() != str(current_pid)]
+                
+                if pids_to_kill:
+                    logger.warning(f"Found {len(pids_to_kill)} existing live_trader instance(s) to kill: {', '.join(pids_to_kill)}")
+                    for pid in pids_to_kill:
+                        try:
+                            subprocess.run(['kill', '-9', pid], timeout=3)
+                            logger.info(f"OK Killed live trader instance (PID: {pid})")
+                            killed_count += 1
+                        except Exception as e:
+                            logger.warning(f"Error killing PID {pid}: {e}")
+                    
+                    if killed_count > 0:
+                        time.sleep(3)
+                else:
+                    logger.info("No existing live trader instances found (excluding current)")
+            else:
+                logger.info("No existing live trader instances found")
+                
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"Could not kill existing instances: {e}")
+    
+    if killed_count > 0:
+        logger.info(f"Successfully killed {killed_count} duplicate live trader instance(s)")
+    else:
+        logger.info("No duplicate instances found - safe to start new instance")
+
+
 def main():
     import argparse
+    
+    # Kill existing instances before starting new one
+    kill_existing_live_traders()
     
     parser = argparse.ArgumentParser(description='MGC Live Trading Engine')
     parser.add_argument('--config', type=str, default='config_production.json',

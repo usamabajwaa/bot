@@ -4,12 +4,13 @@
   "tick_value": 1.0,
   "min_sl_ticks": 4,
   "pivot_strength": 3,
-  "min_rr": 1.3,
-  "position_size_contracts": 3,
+  "min_rr": 1.6,
+  "position_size_contracts": 8,
   "commission_per_contract": 0.62,
   "slippage_ticks": 1,
   "max_trades_per_day": 9999,
-  "daily_loss_limit": -2500,
+  "daily_loss_limit": -1000,
+  "max_position_hours": 8,
   "blocked_days": [],
   "blocked_hours_utc": [],
   "long_trend_filter": {
@@ -20,6 +21,13 @@
     "enabled": false,
     "max_wait_bars": 4,
     "entry_offset_ticks": 1
+  },
+  "entry_timing": {
+    "require_consolidation": false,
+    "consolidation_bars": 3,
+    "min_bars_in_zone": 0,
+    "require_liquidity_sweep": false,
+    "sweep_lookback_bars": 3
   },
   "sessions": {
     "asia": {
@@ -68,7 +76,8 @@
     "min_volume_mult": 0.7
   },
   "vwap_obstruction": {
-    "enabled": true
+    "enabled": true,
+    "buffer_ticks": 3
   },
   "chop_filter": {
     "enabled": true,
@@ -83,19 +92,25 @@
   },
   "partial_profit": {
     "enabled": true,
-    "first_exit_r": 0.8,
+    "first_exit_r": 1.0,
     "first_exit_pct": 0.5,
     "trail_remaining_to_r": 2.0,
     "use_structure_tp": true,
     "structure_based": true,
     "structure_buffer_ticks": 3,
     "liquidity_sweep_buffer_ticks": 10,
-    "post_partial_sl_lock_r": 0.8
+    "post_partial_sl_lock_r": 1.0,
+    "scale_out_mode": "standard",
+    "scale_out_levels": [
+      {"r": 1.0, "pct": 0.33, "move_be": true},
+      {"r": 2.0, "pct": 0.33, "trail_r": 0.5},
+      {"r": 0, "pct": 0.34, "target": "structure"}
+    ]
   },
   "trailing_stop": {
     "enabled": true,
     "activation_r": 0.8,
-    "trail_distance_r": 0.25
+    "trail_distance_r": 1.5
   },
   "zone_decay": {
     "enabled": true,
@@ -106,7 +121,7 @@
   "cooldown": {
     "enabled": true,
     "consecutive_losses_trigger": 2,
-    "pause_bars": 30
+    "pause_bars": 20
   },
   "zone_role_reversal": {
     "enabled": true
@@ -122,19 +137,19 @@
     "require_both": false
   },
   "monte_carlo": {
-    "enabled": true,
+    "enabled": false,
     "iterations": 1000,
     "confidence_level": 0.95
   },
   "walk_forward": {
-    "enabled": true,
+    "enabled": false,
     "train_pct": 0.7,
     "test_pct": 0.3
   },
   "execution_mode": {
-    "execution_model": "ideal_close",
+    "execution_model": "market_slippage",
     "manage_trade": true,
-    "live_like": false,
+    "live_like": true,
     "fill_based_brackets": false
   }
 }

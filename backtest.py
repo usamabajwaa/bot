@@ -6,19 +6,32 @@ import argparse
 
 from strategy import Strategy, SignalType
 from risk import RiskManager, TradeResult
-from reporting import ReportGenerator
-from monte_carlo import MonteCarloSimulator
-from walk_forward import WalkForwardValidator
+
+# Optional imports for advanced reporting (can be removed if not needed)
+try:
+    from reporting import ReportGenerator
+except ImportError:
+    ReportGenerator = None
+
+try:
+    from monte_carlo import MonteCarloSimulator
+except ImportError:
+    MonteCarloSimulator = None
+
+try:
+    from walk_forward import WalkForwardValidator
+except ImportError:
+    WalkForwardValidator = None
 
 
 class BacktestEngine:
-    def __init__(self, config_path: str = 'config.json'):
+    def __init__(self, config_path: str = 'config_production.json'):
         self.config_path = Path(config_path)
         self.config = self._load_config()
         
         self.strategy = Strategy(self.config)
         self.risk_manager = RiskManager(self.config)
-        self.report_generator = ReportGenerator(self.config)
+        self.report_generator = ReportGenerator(self.config) if ReportGenerator else None
         
         self.data: Optional[pd.DataFrame] = None
         self.results: List[TradeResult] = []
@@ -255,23 +268,83 @@ class BacktestEngine:
     def generate_reports(self, output_dir: str = '.') -> dict:
         output_path = Path(output_dir)
         
-        trades_df = self.report_generator.results_to_dataframe(self.results)
-        trades_path = output_path / 'trades.csv'
-        trades_df.to_csv(trades_path, index=False)
-        
-        metrics = self.report_generator.calculate_metrics(self.results)
-        
-        mc_config = self.config.get('monte_carlo', {})
-        if mc_config.get('enabled', True):
-            mc_simulator = MonteCarloSimulator(self.config)
-            mc_results = mc_simulator.run_simulation(self.results)
-            metrics['monte_carlo'] = mc_results
-        
-        wf_config = self.config.get('walk_forward', {})
-        if wf_config.get('enabled', True) and self.data is not None:
-            wf_validator = WalkForwardValidator(self.config)
-            wf_results = wf_validator.validate(self.data, self._run_backtest_on_data)
-            metrics['walk_forward'] = wf_results
+        if not self.report_generator:
+            print("Warning: ReportGenerator not available. Generating basic reports...")
+            # Basic reporting without ReportGenerator
+            import pandas as pd
+            trades_data = []
+            for r in self.results:
+                trades_data.append({
+                    'trade_id': r.trade_id,
+                    'entry_time': r.entry_time,
+                    'final_exit_time': r.final_exit_time,
+                    'side': r.side,
+                    'entry_price': r.entry_price,
+                    'final_exit_price': r.final_exit_price,
+                    'stop_loss': r.stop_loss,
+                    'take_profit': r.take_profit,
+                    'partial_exit_time': r.partial_exit_time,
+                    'partial_exit_price': r.partial_exit_price,
+                    'partial_pnl': r.partial_pnl,
+                    'final_pnl': r.final_pnl,
+                    'total_pnl': r.total_pnl,
+                    'exit_reason': r.exit_reason,
+                    'session': r.session
+                })
+            trades_df = pd.DataFrame(trades_data)
+            trades_path = output_path / 'trades.csv'
+            trades_df.to_csv(trades_path, index=False)
+            
+            # Basic metrics
+            total_trades = len(self.results)
+            winning_trades = [r for r in self.results if r.total_pnl > 0]
+            losing_trades = [r for r in self.results if r.total_pnl < 0]
+            total_pnl = sum(r.total_pnl for r in self.results)
+            
+            # Calculate drawdown from equity curve
+            equity_curve = [0.0]  # Start at 0
+            for result in self.results:
+                equity_curve.append(equity_curve[-1] + result.total_pnl)
+            
+            max_drawdown = 0.0
+            peak_equity = 0.0
+            for equity in equity_curve:
+                if equity > peak_equity:
+                    peak_equity = equity
+                drawdown = peak_equity - equity
+                if drawdown > max_drawdown:
+                    max_drawdown = drawdown
+            
+            metrics = {
+                'total_trades': total_trades,
+                'winning_trades': len(winning_trades),
+                'losing_trades': len(losing_trades),
+                'win_rate': len(winning_trades) / total_trades if total_trades > 0 else 0,
+                'total_pnl': total_pnl,
+                'avg_pnl_per_trade': total_pnl / total_trades if total_trades > 0 else 0,
+                'avg_win': sum(r.total_pnl for r in winning_trades) / len(winning_trades) if winning_trades else 0,
+                'avg_loss': sum(r.total_pnl for r in losing_trades) / len(losing_trades) if losing_trades else 0,
+                'profit_factor': abs(sum(r.total_pnl for r in winning_trades) / sum(r.total_pnl for r in losing_trades)) if losing_trades and sum(r.total_pnl for r in losing_trades) != 0 else 0,
+                'max_drawdown': max_drawdown
+            }
+        else:
+            trades_df = self.report_generator.results_to_dataframe(self.results)
+            trades_path = output_path / 'trades.csv'
+            trades_df.to_csv(trades_path, index=False)
+            
+            metrics = self.report_generator.calculate_metrics(self.results)
+            
+            mc_config = self.config.get('monte_carlo', {})
+            if mc_config.get('enabled', True) and MonteCarloSimulator:
+                mc_simulator = MonteCarloSimulator(self.config)
+                mc_results = mc_simulator.run_simulation(self.results)
+                metrics['monte_carlo'] = mc_results
+            
+            wf_config = self.config.get('walk_forward', {})
+            if wf_config.get('enabled', True) and self.data is not None and WalkForwardValidator:
+                wf_validator = WalkForwardValidator(self.config)
+                wf_results = wf_validator.validate(self.data, self._run_backtest_on_data)
+                metrics['walk_forward'] = wf_results
         
         results_path = output_path / 'results.json'
         with open(results_path, 'w') as f:
@@ -358,7 +431,7 @@ class BacktestEngine:
 
 def main():
     parser = argparse.ArgumentParser(description='MGC Scalping Engine Backtest')
-    parser.add_argument('--config', type=str, default='config.json',
+    parser.add_argument('--config', type=str, default='config_production.json',
                         help='Path to config file')
     parser.add_argument('--data', type=str, default='data.csv',
                         help='Path to data file')

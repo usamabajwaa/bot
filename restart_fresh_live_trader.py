@@ -92,3 +92,7 @@ print("\nLive trader should now be running.")
 print("Check status with: python check_running_instances.py")
 print("=" * 70)
 
+
+
+
+

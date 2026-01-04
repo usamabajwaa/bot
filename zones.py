@@ -60,11 +60,32 @@ class Zone:
         weight = np.exp(-age / decay_hours)
         return max(0.1, min(1.0, weight))  # Clamp between 0.1 and 1.0
     
-    def combined_score(self, current_time: pd.Timestamp = None) -> float:
-        """Combined score considering age, confidence, and quality"""
+    def combined_score(self, current_time: pd.Timestamp = None, 
+                      recent_touch_penalty: bool = True) -> float:
+        """Combined score considering age, confidence, quality, and touch recency"""
         age_w = self.age_weight(current_time)
-        # Weights: 40% age, 30% confidence, 30% quality
-        return 0.4 * age_w + 0.3 * self.confidence + 0.3 * self.quality_score
+        
+        # Penalize recently touched zones (liquidity already taken)
+        touch_penalty = 1.0
+        if recent_touch_penalty and self.last_touch_index is not None:
+            # FIXED: Correct calculation - touch happens AFTER creation
+            if hasattr(self, 'created_index'):
+                bars_since_touch = self.last_touch_index - self.created_index
+                # Assuming 3-minute bars: 20 bars = 60 minutes
+                if bars_since_touch >= 0 and bars_since_touch < 20:
+                    touch_penalty = 0.7  # Reduce score for recently touched zones
+            else:
+                # Fallback: use time-based calculation if created_index not available
+                if current_time and hasattr(self, 'created_time'):
+                    time_since_touch_hours = (current_time - self.created_time).total_seconds() / 3600
+                    if time_since_touch_hours < 1:  # Less than 1 hour
+                        touch_penalty = 0.7
+        
+        # Weights: 35% age, 25% confidence, 25% quality, 15% touch recency
+        return (0.35 * age_w + 
+                0.25 * self.confidence + 
+                0.25 * self.quality_score + 
+                0.15 * touch_penalty)
 
 
 class ZoneManager:
@@ -101,6 +122,14 @@ class ZoneManager:
         self.last_build_time: Optional[pd.Timestamp] = None
         self.zones_built_today: bool = False
         
+        # Zone lookup cache for performance optimization
+        self._zone_spatial_index = {}  # Cache key -> list of zones
+        self._cache_valid_until_index = 0
+    
+    def _invalidate_spatial_cache(self):
+        """Invalidate zone lookup cache (call when zones are updated)"""
+        self._zone_spatial_index = {}
+    
     def create_zone_from_pivot(
         self,
         pivot_type: str,
@@ -207,8 +236,21 @@ class ZoneManager:
         bar_low: float,
         bar_high: float,
         bar_index: int,
-        zone_type: Optional[ZoneType] = None
+        zone_type: Optional[ZoneType] = None,
+        use_cache: bool = True
     ) -> List[Zone]:
+        # Rebuild cache if zones changed or cache expired
+        if use_cache and (bar_index > self._cache_valid_until_index):
+            self._invalidate_spatial_cache()
+            self._cache_valid_until_index = bar_index + 10  # Cache for 10 bars
+        
+        # Use cached lookup if available
+        if use_cache:
+            cache_key = (round(bar_low, 2), round(bar_high, 2), zone_type)
+            if cache_key in self._zone_spatial_index:
+                return self._zone_spatial_index[cache_key]
+        
+        # Original lookup
         touched = []
         
         for zone in self.zones:
@@ -372,6 +414,10 @@ class ZoneManager:
             logger = logging.getLogger(__name__)
             logger.info(f"Zone role reversal: {supply_to_demand} supply->demand, {demand_to_supply} demand->supply")
         
+        # Invalidate cache when zones are converted
+        if converted:
+            self._invalidate_spatial_cache()
+        
         return converted
     
     def get_most_recent_zone(
@@ -383,6 +429,8 @@ class ZoneManager:
         return max(zones, key=lambda z: z.created_index)
     
     def reset(self) -> None:
+        # Invalidate cache on reset
+        self._invalidate_spatial_cache()
         self.zones = []
         self.zone_counter = 0
     

@@ -43,6 +43,9 @@ class Position:
     exit_reason: str = ''
     structure_levels: List[float] = field(default_factory=list)
     last_broken_level: Optional[float] = None
+    highest_price: Optional[float] = None  # Track highest price for trailing stop (long)
+    lowest_price: Optional[float] = None   # Track lowest price for trailing stop (short)
+    scale_out_levels_done: List[int] = field(default_factory=list)  # Track completed scale-out levels
 
 
 @dataclass
@@ -126,6 +129,11 @@ class RiskManager:
         
         self.max_trades_per_day = config.get('max_trades_per_day', 6)
         self.daily_loss_limit = config.get('daily_loss_limit', -2500)
+        self.max_position_hours = config.get('max_position_hours', 8)  # Force close after N hours
+        
+        # Graduated scale-out levels
+        self.scale_out_levels = partial_config.get('scale_out_levels', [])
+        self.scale_out_mode = partial_config.get('scale_out_mode', 'standard')  # 'standard' or 'graduated'
         
         self.trade_counter = 0
         self.order_counter = 0
@@ -308,7 +316,8 @@ class RiskManager:
         self,
         exit_price: float,
         timestamp: pd.Timestamp,
-        bar_index: int
+        bar_index: int,
+        reason: str = 'hard_daily_stop'
     ) -> Optional[TradeResult]:
         if self.current_position is None:
             return None
@@ -334,7 +343,7 @@ class RiskManager:
         pos.final_exit_price = actual_exit
         pos.final_pnl = net_pnl
         pos.total_pnl = pos.partial_pnl + pos.final_pnl
-        pos.exit_reason = 'hard_daily_stop'
+        pos.exit_reason = reason
         pos.status = PositionStatus.CLOSED
         
         total_ticks = (pos.total_pnl + self.commission_per_contract * pos.contracts * 2) / (self.tick_value * pos.contracts)
@@ -361,6 +370,12 @@ class RiskManager:
             exit_reason='hard_daily_stop',
             cooldown_active=self.is_in_cooldown()
         )
+        
+        # #region agent log
+        import json
+        with open(r'd:\Trade\mgc_engine_final\.cursor\debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"risk.py:374","message":"TradeResult created in force_close_position","data":{"trade_id":pos.trade_id,"partial_exit_done":pos.partial_exit_done,"partial_pnl":pos.partial_pnl,"final_pnl":pos.final_pnl,"total_pnl":pos.total_pnl,"remaining_contracts":pos.remaining_contracts,"contracts":pos.contracts,"exit_reason":reason},"timestamp":int(timestamp.timestamp()*1000)})+'\n')
+        # #endregion
         
         self.trade_results.append(result)
         
@@ -413,7 +428,9 @@ class RiskManager:
             confirmation_type=confirmation_type,
             risk_ticks=risk_ticks,
             reward_ticks=reward_ticks,
-            structure_levels=structure_levels or []
+            structure_levels=structure_levels or [],
+            highest_price=actual_entry_price,  # Initialize with entry price
+            lowest_price=actual_entry_price     # Initialize with entry price
         )
         
         # Log decision to structured CSV for model improvement
@@ -543,9 +560,41 @@ class RiskManager:
         close = bar['close']
         timestamp = pd.Timestamp(bar['timestamp'])
         
+        # Update highest/lowest price tracking for trailing stops
+        if pos.highest_price is None:
+            pos.highest_price = pos.entry_price
+        if pos.lowest_price is None:
+            pos.lowest_price = pos.entry_price
+        
+        # Track the best price reached since entry
+        if pos.side == 'long':
+            pos.highest_price = max(pos.highest_price, high)
+        else:  # short
+            pos.lowest_price = min(pos.lowest_price, low)
+        
+        # Check max position duration
+        if self.max_position_hours > 0:
+            duration_hours = (timestamp - pos.entry_time).total_seconds() / 3600
+            if duration_hours > self.max_position_hours:
+                # Force close position due to max duration
+                exit_result = self.force_close_position(
+                    exit_price=close,
+                    timestamp=timestamp,
+                    bar_index=bar_index,
+                    reason='max_position_duration'
+                )
+                if exit_result is not None:
+                    return exit_result, True
+        
         self._check_break_even(pos, high, low)
         
         partial_result = self._check_partial_profit(pos, high, low, timestamp)
+        
+        # #region agent log
+        import json
+        with open(r'd:\Trade\mgc_engine_final\.cursor\debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"risk.py:585","message":"After partial check","data":{"trade_id":pos.trade_id,"partial_result":partial_result,"remaining_contracts":pos.remaining_contracts,"status":pos.status.value if hasattr(pos.status,'value') else str(pos.status)},"timestamp":int(timestamp.timestamp()*1000)})+'\n')
+        # #endregion
         
         # Check if price broke through a structure level - move SL behind it
         self._check_structure_level_break(pos, high, low)
@@ -553,6 +602,12 @@ class RiskManager:
         self._update_trailing_stop(pos, high, low)
         
         exit_result = self._check_exit(pos, high, low, close, timestamp, bar_index)
+        
+        # #region agent log
+        import json
+        with open(r'd:\Trade\mgc_engine_final\.cursor\debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"risk.py:592","message":"After exit check","data":{"trade_id":pos.trade_id,"exit_result":exit_result is not None,"remaining_contracts":pos.remaining_contracts if pos else None},"timestamp":int(timestamp.timestamp()*1000)})+'\n')
+        # #endregion
         
         if exit_result is not None:
             return exit_result, True
@@ -616,16 +671,25 @@ class RiskManager:
         trail_distance = self.trailing_distance_r * risk
         
         if pos.side == 'long':
-            current_profit = high - pos.entry_price
+            # Use the highest price reached since entry, not just current bar's high
+            best_price = pos.highest_price if pos.highest_price is not None else pos.entry_price
+            current_profit = best_price - pos.entry_price
             if current_profit >= activation_distance:
-                new_sl = high - trail_distance
+                new_sl = best_price - trail_distance
+                # Only move stop up (never down)
                 if new_sl > pos.current_stop_loss:
                     pos.current_stop_loss = new_sl
-        else:
-            current_profit = pos.entry_price - low
+        else:  # short
+            # Use the lowest price reached since entry, not just current bar's low
+            best_price = pos.lowest_price if pos.lowest_price is not None else pos.entry_price
+            current_profit = pos.entry_price - best_price
             if current_profit >= activation_distance:
-                new_sl = low + trail_distance
+                new_sl = best_price + trail_distance
+                # Only move stop down (toward entry) for shorts, but ensure it stays >= entry
+                # For shorts, stop is above entry, so we want new_sl < current_stop_loss
                 if new_sl < pos.current_stop_loss:
+                    # Ensure stop doesn't go below entry for shorts
+                    new_sl = max(new_sl, pos.entry_price)
                     pos.current_stop_loss = new_sl
     
     def _check_break_even(
@@ -684,9 +748,20 @@ class RiskManager:
         low: float,
         timestamp: pd.Timestamp
     ) -> bool:
+        # #region agent log
+        import json
+        with open(r'd:\Trade\mgc_engine_final\.cursor\debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"risk.py:726","message":"_check_partial_profit called","data":{"trade_id":pos.trade_id,"partial_enabled":self.partial_enabled,"scale_out_mode":self.scale_out_mode,"has_scale_out_levels":bool(self.scale_out_levels),"partial_exit_done":pos.partial_exit_done},"timestamp":int(timestamp.timestamp()*1000)})+'\n')
+        # #endregion
+        
         if not self.partial_enabled:
             return False
         
+        # Check if using graduated scale-out levels
+        if self.scale_out_mode == 'graduated' and self.scale_out_levels:
+            return self._check_gradual_partial_exit(pos, high, low, timestamp)
+        
+        # Legacy single partial exit (backward compatibility)
         if pos.partial_exit_done:
             return False
         
@@ -741,6 +816,173 @@ class RiskManager:
         
         return False
     
+    def _check_gradual_partial_exit(
+        self,
+        pos: Position,
+        high: float,
+        low: float,
+        timestamp: pd.Timestamp
+    ) -> bool:
+        """Check for graduated scale-out levels"""
+        scale_levels = self.scale_out_levels
+        
+        if not scale_levels:
+            return False
+        
+        entry = pos.entry_price
+        initial_sl = pos.initial_stop_loss
+        side = pos.side
+        risk = abs(entry - initial_sl)
+        scale_out_done = pos.scale_out_levels_done
+        
+        for level_idx, level_config in enumerate(scale_levels):
+            if level_idx in scale_out_done:
+                continue  # Already exited at this level
+            
+            target_r = level_config.get('r', 0)
+            exit_pct = level_config.get('pct', 0.33)
+            
+            # Calculate target price
+            if target_r > 0:
+                # R-based target
+                if side == 'long':
+                    target_price = entry + (risk * target_r)
+                    if high >= target_price:
+                        self._execute_scaled_partial(pos, target_price, exit_pct, level_idx, level_config, timestamp)
+                        return True
+                else:  # short
+                    target_price = entry - (risk * target_r)
+                    if low <= target_price:
+                        self._execute_scaled_partial(pos, target_price, exit_pct, level_idx, level_config, timestamp)
+                        return True
+            elif target_r == 0 and level_config.get('target') == 'structure':
+                # Structure-based target (for final level)
+                if pos.structure_levels:
+                    buffer = self.structure_buffer_ticks * self.tick_size * 2
+                    if side == 'long':
+                        for level in pos.structure_levels:
+                            if level > entry:
+                                target_price = level - buffer
+                                if high >= target_price:
+                                    self._execute_scaled_partial(pos, target_price, exit_pct, level_idx, level_config, timestamp)
+                                    return True
+                                break
+                    else:  # short
+                        for level in pos.structure_levels:
+                            if level < entry:
+                                target_price = level + buffer
+                                if low <= target_price:
+                                    self._execute_scaled_partial(pos, target_price, exit_pct, level_idx, level_config, timestamp)
+                                    return True
+                                break
+        
+        return False
+    
+    def _execute_scaled_partial(
+        self,
+        pos: Position,
+        exit_price: float,
+        exit_pct: float,
+        level_idx: int,
+        level_config: dict,
+        timestamp: pd.Timestamp
+    ) -> None:
+        """Execute a scaled partial exit with level-specific actions"""
+        side = pos.side
+        current_contracts = pos.remaining_contracts if pos.partial_exit_done else pos.contracts
+        
+        slippage = self.slippage_ticks * self.tick_size
+        if side == 'long':
+            actual_exit = exit_price - slippage
+        else:
+            actual_exit = exit_price + slippage
+        
+        contracts_to_close = max(1, int(current_contracts * exit_pct))
+        
+        if contracts_to_close >= current_contracts:
+            # Close all remaining contracts
+            contracts_to_close = current_contracts
+        
+        if side == 'long':
+            pnl_ticks = (actual_exit - pos.entry_price) / self.tick_size
+        else:
+            pnl_ticks = (pos.entry_price - actual_exit) / self.tick_size
+        
+        gross_pnl = pnl_ticks * self.tick_value * contracts_to_close
+        commission = self.commission_per_contract * contracts_to_close * 2
+        net_pnl = gross_pnl - commission
+        
+        # Track completed level
+        if level_idx not in pos.scale_out_levels_done:
+            pos.scale_out_levels_done.append(level_idx)
+        
+        # Update position state
+        if not pos.partial_exit_done:
+            pos.partial_exit_done = True
+            pos.partial_exit_time = timestamp
+            pos.partial_exit_price = actual_exit
+            pos.partial_pnl = net_pnl
+        else:
+            # Multiple partial exits - accumulate P&L
+            pos.partial_pnl += net_pnl
+            # Update exit time to latest
+            pos.partial_exit_time = timestamp
+        
+        pos.remaining_contracts = current_contracts - contracts_to_close
+        
+        # CRITICAL: If all contracts are closed, fully close the position
+        if pos.remaining_contracts <= 0:
+            # This partial exit closed all remaining contracts - treat as full exit
+            pos.remaining_contracts = 0
+            pos.final_exit_time = timestamp
+            pos.final_exit_price = actual_exit
+            pos.final_pnl = net_pnl  # This is the final exit P&L (not additional partial)
+            pos.total_pnl = pos.partial_pnl + pos.final_pnl
+            pos.exit_reason = 'partial_exit_complete'
+            pos.status = PositionStatus.CLOSED
+        else:
+            pos.status = PositionStatus.PARTIAL_CLOSED
+        
+        # #region agent log
+        import json
+        with open(r'd:\Trade\mgc_engine_final\.cursor\debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"risk.py:907","message":"Partial exit executed","data":{"trade_id":pos.trade_id,"level_idx":level_idx,"contracts_to_close":contracts_to_close,"remaining_contracts":pos.remaining_contracts,"original_contracts":pos.contracts,"partial_pnl":pos.partial_pnl,"net_pnl":net_pnl,"status":pos.status.value if hasattr(pos.status,'value') else str(pos.status)},"timestamp":int(timestamp.timestamp()*1000)})+'\n')
+        # #endregion
+        
+        # Handle level-specific actions
+        if level_config.get('move_be', False):
+            # Move stop to break-even (disabled in adjusted config, but keeping logic)
+            pos.current_stop_loss = pos.entry_price
+            pos.break_even_triggered = True
+        else:
+            # Don't move to exact break-even - use partial profit lock instead
+            # Lock in some profit but give room for retracement
+            risk = abs(pos.entry_price - pos.initial_stop_loss)
+            profit_lock_r = self.post_partial_sl_lock_r * 0.6  # Use 60% of configured lock (less aggressive)
+            if side == 'long':
+                new_sl = pos.entry_price + (risk * profit_lock_r)
+                if new_sl > pos.current_stop_loss:
+                    pos.current_stop_loss = new_sl
+            else:  # short
+                new_sl = pos.entry_price - (risk * profit_lock_r)
+                if new_sl < pos.current_stop_loss:
+                    pos.current_stop_loss = new_sl
+        
+        if 'trail_r' in level_config:
+            # Activate trailing stop for remaining position
+            trail_r = level_config['trail_r']
+            risk = abs(pos.entry_price - pos.initial_stop_loss)
+            if side == 'long':
+                trail_distance = risk * trail_r
+                trail_price = actual_exit - trail_distance
+                if trail_price > pos.current_stop_loss:
+                    pos.current_stop_loss = trail_price
+            else:  # short
+                trail_distance = risk * trail_r
+                trail_price = actual_exit + trail_distance
+                if trail_price < pos.current_stop_loss:
+                    pos.current_stop_loss = trail_price
+    
     def _execute_partial_exit(
         self,
         pos: Position,
@@ -773,6 +1015,12 @@ class RiskManager:
         pos.remaining_contracts = pos.contracts - contracts_to_close
         pos.status = PositionStatus.PARTIAL_CLOSED
         
+        # #region agent log
+        import json
+        with open(r'd:\Trade\mgc_engine_final\.cursor\debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"risk.py:974","message":"Legacy partial exit executed","data":{"trade_id":pos.trade_id,"contracts_to_close":contracts_to_close,"remaining_contracts":pos.remaining_contracts,"original_contracts":pos.contracts,"partial_pnl":pos.partial_pnl},"timestamp":int(timestamp.timestamp()*1000)})+'\n')
+        # #endregion
+        
         # Move SL to lock partial profit (configurable, default 0.5R gives room for retest)
         risk = abs(pos.entry_price - pos.initial_stop_loss)
         trailing_distance = self.post_partial_sl_lock_r * risk
@@ -793,6 +1041,10 @@ class RiskManager:
         timestamp: pd.Timestamp,
         bar_index: int
     ) -> Optional[TradeResult]:
+        # CRITICAL: Prevent duplicate TradeResult creation if position already closed
+        if pos.status == PositionStatus.CLOSED:
+            return None
+        
         sl_hit = False
         tp_hit = False
         
@@ -870,6 +1122,12 @@ class RiskManager:
             pnl=net_pnl,
             exit_reason=exit_reason
         )
+        
+        # #region agent log
+        import json
+        with open(r'd:\Trade\mgc_engine_final\.cursor\debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"risk.py:1074","message":"TradeResult created in _check_exit","data":{"trade_id":pos.trade_id,"partial_exit_done":pos.partial_exit_done,"partial_pnl":pos.partial_pnl,"final_pnl":pos.final_pnl,"total_pnl":pos.total_pnl,"remaining_contracts":pos.remaining_contracts,"contracts":pos.contracts,"exit_reason":exit_reason},"timestamp":int(timestamp.timestamp()*1000)})+'\n')
+        # #endregion
         
         self.trade_results.append(result)
         

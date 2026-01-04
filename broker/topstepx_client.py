@@ -360,13 +360,15 @@ class TopstepXClient:
         if stop_loss_ticks is not None:
             data["stopLossBracket"] = {
                 "ticks": stop_loss_ticks,
-                "type": stop_loss_type
+                "type": stop_loss_type,
+                "size": size  # CRITICAL: Ensure bracket order size matches main order size
             }
         
         if take_profit_ticks is not None:
             data["takeProfitBracket"] = {
                 "ticks": take_profit_ticks,
-                "type": take_profit_type
+                "type": take_profit_type,
+                "size": size  # CRITICAL: Ensure bracket order size matches main order size
             }
         
         if custom_tag:
